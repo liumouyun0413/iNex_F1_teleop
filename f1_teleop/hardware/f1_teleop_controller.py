@@ -1,0 +1,514 @@
+"""
+F1RokaeTeleopController —— F1（珞石 Rokae 双臂 + iNex ROS2 驱动）真机遥操作控制器。
+
+对应官方示例 GalaxeaR1LiteTeleopController 的角色：把通用 IK 骨架
+（HardwareTeleopController）与 F1-Rokae 的硬件接口（iNex 双臂 / 夹爪 / 头 / 腰 / 底盘 /
+安全门 / 数采）组装起来。结构与 f1_tianji_teleop 的 F1TeleopController 完全一致，
+差异只在双臂接口（ServoJ 流 + 速度受限规划器）与启动时序（iNex 上电/模式/ServoJ）。
+
+手柄按键一览
+------------
+  握把(grip) > 0.9          激活对应臂，手柄位姿增量 → 末端位姿
+  扳机(trigger)             夹爪开合（0 → 张开指令，1 → 闭合指令）
+  left_axis_click           末端模式 = position（纯位置）
+  right_axis_click          末端模式 = orientation（纯姿态）
+  两摇杆同时按压            末端模式 = pose（位置+姿态，默认）
+  X + Y                     双臂复位到 reset_pose（S 曲线），Placo 同步
+  Y 长按 0.3s               腰部上升一步        X 长按 0.3s   腰部下降一步
+  A                         开始数采            B             停止数采
+  右扳机按住 + 双握把松开   头部模式（head.enable=true 时下发 ServoJ part=3）
+  右摇杆上拨                底盘使能            右摇杆下拨    底盘停止
+  底盘使能后：左摇杆 → 前后/横移，右摇杆 X → 旋转（头部模式期间挂起）
+
+设计说明
+--------
+* Placo 是开环"虚拟机器人"：启动 / 复位时用真机位姿同步一次，之后只由手柄驱动。
+* Placo 弧度 ↔ 驱动度 的映射集中在 JointMap，正反两向共用同一组参数。
+* ServoJ 流在首次有臂激活后持续 100Hz 下发（规划器保持目标），复位期间由复位线程独占通道。
+"""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+
+from f1_teleop.common.hardware_teleop_controller import HardwareTeleopController
+from f1_teleop.hardware.interface import (
+    BagRecorder,
+    ExternalPoseInput,
+    F1ChassisController,
+    F1WaistController,
+    InexArmController,
+    InexClient,
+    InexHeadController,
+    LeadDataPublisher,
+    RecordingManager,
+    RosContext,
+    SafetyGuard,
+    ServoJPlanner,
+    TianjiRecorderClient,
+)
+from f1_teleop.hardware.interface.inex_client import PART_LEFT_ARM, PART_RIGHT_ARM
+from f1_teleop.utils.control_utils import HoldTrigger, JointMap, RateLimiter, RisingEdge
+
+ARM_ORDER = ("left_arm", "right_arm")
+_SIDE = {"left_arm": "left", "right_arm": "right"}
+_PART = {"left_arm": PART_LEFT_ARM, "right_arm": PART_RIGHT_ARM}
+
+
+def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
+    r, g = cfg.robot, cfg.teleop.gripper
+    return {
+        "left_arm": {
+            "link_name": r.left_ee_link,
+            "joint_names": list(r.urdf_left_joint_names),
+            "shoulder_link": getattr(r, "left_shoulder_link", None),
+            "pose_source": "left_controller",
+            "control_trigger": "left_grip",
+            "gripper_config": {"gripper_trigger": "left_trigger", "open_pos": g.open_cmd, "close_pos": g.close_cmd},
+        },
+        "right_arm": {
+            "link_name": r.right_ee_link,
+            "joint_names": list(r.urdf_right_joint_names),
+            "shoulder_link": getattr(r, "right_shoulder_link", None),
+            "pose_source": "right_controller",
+            "control_trigger": "right_grip",
+            "gripper_config": {"gripper_trigger": "right_trigger", "open_pos": g.open_cmd, "close_pos": g.close_cmd},
+        },
+    }
+
+
+class F1RokaeTeleopController(HardwareTeleopController):
+    def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
+        self.cfg = cfg
+        r, t = cfg.robot, cfg.teleop
+
+        self.joint_map: Dict[str, JointMap] = {
+            "left_arm": JointMap.from_lists(r.joint_map.left.sign, r.joint_map.left.offset_deg),
+            "right_arm": JointMap.from_lists(r.joint_map.right.sign, r.joint_map.right.offset_deg),
+        }
+        self.home_pose_deg = np.array([*r.home_pose.left, *r.home_pose.right], dtype=float)
+        self.reset_pose_deg = np.array([*r.reset_pose.left, *r.reset_pose.right], dtype=float)
+
+        super().__init__(
+            robot_urdf_path=r.urdf_path,
+            manipulator_config=build_manipulator_config(cfg),
+            scale_factor=t.scale_factor,
+            visualize_placo=visualize_placo,
+            control_rate_hz=int(t.control_rate_hz),
+            aux_rate_hz=float(cfg.ros.lead_publish_rate_hz),
+            grip_activate_threshold=t.grip_activate_threshold,
+            frame_task_weight=t.ik.frame_task_weight,
+            manipulability_weight=t.ik.manipulability_weight,
+            joint_regularization_weight=t.ik.joint_regularization_weight,
+            workspace_radius=t.workspace_radius,
+            max_ee_speed=getattr(t, "max_ee_speed_m_s", None),
+            max_ee_ang_speed=getattr(t, "max_ee_ang_speed_rad_s", None),
+            enable_joint_velocity_limits=bool(getattr(t.ik, "enable_joint_velocity_limits", False)),
+            joint_limit_mode=getattr(t.ik, "joint_limit_mode", "clamp"),
+        )
+        # 先用配置表收紧限位；连上驱动后再用 /inex/get_soft_limits 的实测值覆盖
+        self._apply_driver_joint_limits(self._limits_cfg_to_dict(getattr(r, "arm_joint_limits_deg", None)))
+        self.sync_arm_joints(self._deg14_to_placo(self.home_pose_deg))
+
+        # 运行时状态
+        self._resetting = threading.Event()
+        self._streaming = False            # 首次有臂激活后开始持续 ServoJ 流
+        self._head_active = False
+        self._xy_edge = RisingEdge()
+        self._y_hold = HoldTrigger(t.waist_button_hold_sec)
+        self._x_hold = HoldTrigger(t.waist_button_hold_sec)
+        self._a_edge = RisingEdge()
+        self._b_edge = RisingEdge()
+        self._base_up_edge = RisingEdge()
+        self._base_down_edge = RisingEdge()
+        self._gripper_limiter = RateLimiter(cfg.teleop.gripper.publish_rate_hz)
+        self._max_step_deg = float(getattr(t, "max_joint_speed_deg_s", 180.0)) / self.control_rate_hz
+
+        # 硬件接口在 _robot_setup 中创建
+        self.ros: Optional[RosContext] = None
+        self.inex: Optional[InexClient] = None
+        self.arm: Optional[InexArmController] = None
+        self.head: Optional[InexHeadController] = None
+        self.chassis: Optional[F1ChassisController] = None
+        self.waist: Optional[F1WaistController] = None
+        self.lead_pub: Optional[LeadDataPublisher] = None
+        self.external_input: Optional[ExternalPoseInput] = None
+        self.recorder: Optional[RecordingManager] = None
+        self.safety: Optional[SafetyGuard] = None
+
+    # ------------------------------------------------------------------ #
+    # 关节映射 / 限位辅助
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _limits_cfg_to_dict(limits_cfg) -> Optional[Dict[str, Tuple[float, float]]]:
+        if not limits_cfg:
+            return None
+        return {k: (v[0], v[1]) for k, v in vars(limits_cfg).items()}
+
+    def _apply_driver_joint_limits(self, limits: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]]) -> None:
+        """把驱动软限位（度，驱动坐标）换算到 Placo 坐标后写入模型。
+
+        驱动限位为权威来源：该 URDF 的关节零位与真机差 180°（见 joint_map.offset_deg），
+        其声明的 <limit> 区间与物理行程并不对应，因此不与 URDF 限位取交集；
+        仅当某侧驱动限位缺失（None）时才回退到 URDF 声明值。
+        """
+        if not limits:
+            return
+        r = self.cfg.robot
+        name_to_arm = {}
+        for i, n in enumerate(r.left_joint_names):
+            name_to_arm[n] = ("left_arm", i)
+        for i, n in enumerate(r.right_joint_names):
+            name_to_arm[n] = ("right_arm", i)
+
+        new_limits = {arm: [lo.copy(), hi.copy()] for arm, (lo, hi) in self.arm_q_limits.items()}
+        for real_name, (lo_deg, hi_deg) in limits.items():
+            if real_name not in name_to_arm:
+                print(f"[Placo] ⚠️ arm_joint_limits_deg 未知关节 {real_name}")
+                continue
+            arm, idx = name_to_arm[real_name]
+            jm = self.joint_map[arm]
+            urdf_lo, urdf_hi = float(new_limits[arm][0][idx]), float(new_limits[arm][1][idx])
+
+            def to_deg(rad):
+                full = np.zeros(7); full[idx] = rad
+                return float(jm.rad_to_deg(full)[idx])
+
+            def to_rad(deg):
+                full = np.zeros(7); full[idx] = deg
+                return float(jm.deg_to_rad(full)[idx])
+
+            urdf_deg = sorted((to_deg(urdf_lo), to_deg(urdf_hi)))
+            d_lo = urdf_deg[0] if lo_deg is None else float(lo_deg)
+            d_hi = urdf_deg[1] if hi_deg is None else float(hi_deg)
+            lo, hi = sorted((to_rad(d_lo), to_rad(d_hi)))
+            new_limits[arm][0][idx], new_limits[arm][1][idx] = lo, hi
+            print(f"[Placo] {real_name} 限位 驱动[{d_lo:.1f}, {d_hi:.1f}]° = URDF[{np.rad2deg(lo):.1f}, {np.rad2deg(hi):.1f}]°")
+        for arm, (lo, hi) in new_limits.items():
+            self.set_arm_joint_limits(arm, lo, hi)
+
+    def _apply_runtime_soft_limits(self) -> None:
+        """用 /inex/get_soft_limits 的实测软限位覆盖配置表（查询失败则保留配置表）。"""
+        r = self.cfg.robot
+        margin = float(getattr(r, "soft_limit_margin_deg", 0.0))
+        limits = {}
+        for arm, part, names in (("left_arm", PART_LEFT_ARM, r.left_joint_names),
+                                 ("right_arm", PART_RIGHT_ARM, r.right_joint_names)):
+            soft = self.inex.get_soft_limits_deg(part)
+            if soft is None:
+                print(f"[Setup] {arm} 软限位查询失败，沿用配置表")
+                continue
+            print(f"[Setup] {arm} 驱动软限位(deg): {[(round(a, 1), round(b, 1)) for a, b in soft]}")
+            for n, (lo, hi) in zip(names, soft):
+                limits[n] = (lo + margin, hi - margin)
+        if limits:
+            self._apply_driver_joint_limits(limits)
+
+    def _deg14_to_placo(self, arm_deg: np.ndarray) -> Dict[str, np.ndarray]:
+        return {
+            "left_arm": self.joint_map["left_arm"].deg_to_rad(arm_deg[:7]),
+            "right_arm": self.joint_map["right_arm"].deg_to_rad(arm_deg[7:14]),
+        }
+
+    def _placo_to_deg14(self) -> np.ndarray:
+        return np.concatenate([self.joint_map[n].rad_to_deg(self.get_arm_q(n)) for n in ARM_ORDER])
+
+    def _sync_to_robot_pose(self, arm_deg: np.ndarray) -> None:
+        """Placo、安全门、ServoJ 规划器同时对齐到给定真机位姿（度）。"""
+        self.sync_arm_joints(self._deg14_to_placo(arm_deg))
+        if self.safety:
+            self.safety.reset_last_safe(arm_deg)
+        if self.arm:
+            self.arm.anchor_planner(arm_deg)
+
+    def _body_state_deg(self) -> np.ndarray:
+        """安全门用的 8 维 [head j1..3, body j1..5]（度）；body 可按配置反序。"""
+        head = self.arm.get_part_deg("head", 3)
+        body = self.arm.get_part_deg("body", 5)
+        if getattr(self.cfg.safety, "body_joint_order_reversed", False):
+            body = body[::-1]
+        return np.concatenate([head, body])
+
+    # ------------------------------------------------------------------ #
+    # 初始化 / 停机
+    # ------------------------------------------------------------------ #
+    def _robot_setup(self) -> None:
+        cfg, r, ros_cfg, inex_cfg = self.cfg, self.cfg.robot, self.cfg.ros, self.cfg.inex
+        self.ros = RosContext(ros_cfg.node_name)
+        self.inex = InexClient(self.ros, service_timeout=inex_cfg.service_timeout_sec)
+
+        pl = inex_cfg.servo_planner
+        planner = None
+        if pl.enable:
+            planner = ServoJPlanner(14, pl.vmax_deg_s, pl.amax_deg_s2, pl.tau_fast_sec, pl.tau_slow_sec, pl.gate_deg,
+                                    mode=getattr(pl, "mode", ServoJPlanner.MODE_CLAMP))
+            print(f"[Setup] ServoJ 规划器 mode={planner.mode} vmax={pl.vmax_deg_s}°/s amax={pl.amax_deg_s2}°/s²")
+        self.arm = InexArmController(
+            self.ros,
+            servo_cmd_topic=ros_cfg.servo_cmd_topic,
+            joint_state_topic=ros_cfg.joint_state_topic,
+            gripper_left_cmd_topic=ros_cfg.gripper_left_cmd_topic,
+            gripper_right_cmd_topic=ros_cfg.gripper_right_cmd_topic,
+            gripper_max_effort=cfg.teleop.gripper.max_effort,
+            planner=planner,
+        )
+        self.chassis = F1ChassisController(
+            self.ros,
+            move_topic=cfg.chassis.move_topic,
+            control_mode_service=cfg.chassis.control_mode_service,
+            control_mode_value=cfg.chassis.control_mode_value,
+            frame_id=cfg.chassis.frame_id,
+            publish_rate_hz=cfg.chassis.publish_rate_hz,
+        )
+        self.waist = F1WaistController(self.ros, ros_cfg.waist_cmd_topic)
+        self.lead_pub = LeadDataPublisher(
+            self.ros,
+            joint_state_topic=ros_cfg.lead_joint_state_topic,
+            left_tcp_topic=ros_cfg.lead_left_tcp_topic,
+            right_tcp_topic=ros_cfg.lead_right_tcp_topic,
+            lead_joint_names=[*r.urdf_left_joint_names, *r.urdf_right_joint_names, *r.head_joint_names],
+        )
+        self.external_input = ExternalPoseInput(
+            self.ros, ros_cfg.replay_mode_topic, ros_cfg.replay_left_tcp_topic, ros_cfg.replay_right_tcp_topic
+        )
+        rec = cfg.recording
+        self.recorder = RecordingManager(
+            bag=BagRecorder(rec.bag_dir, rec.topics, rec.storage, rec.validate) if rec.enable else None,
+            tianji=TianjiRecorderClient(self.ros, ros_cfg.tianji_start_topic, ros_cfg.tianji_stop_topic),
+        )
+
+        # 1. 等真机状态
+        print(f"[Setup] 等待 {ros_cfg.joint_state_topic} ...")
+        if not self.arm.wait_for_state(timeout=inex_cfg.state_timeout_sec):
+            raise RuntimeError(f"未收到 {ros_cfg.joint_state_topic}，iNex 驱动未启动？")
+
+        # 2. iNex 准备时序：心跳 → 上电 → 模式 → JOINT_POSITION → ServoJ
+        if not self.inex.prepare_arms():
+            if inex_cfg.require_powered:
+                raise RuntimeError("双臂上电复核失败（inex.require_powered=true），终止启动")
+        self.arm.wait_servo_subscriber(timeout=inex_cfg.servo_subscriber_timeout_sec)
+        self._apply_runtime_soft_limits()
+
+        # 3. 头部：目标从真实角度起步（可选 ServoJ 下发）
+        self.head = InexHeadController(
+            self.ros,
+            limits_deg=cfg.head.limits_deg,
+            step_deg_per_frame=cfg.head.step_deg_per_frame,
+            servo_cmd_topic=ros_cfg.servo_cmd_topic,
+            enable=bool(cfg.head.enable),
+            inex=self.inex,
+            servo_axes=int(getattr(cfg.head, "servo_axes", 6)),
+        )
+        self.head.set_target(self.arm.get_part_deg("head", len(r.head_joint_names)))
+
+        # 4. 双臂回零位（S 曲线），Placo / 规划器同步，夹爪初始化
+        self.arm.move_to(self.home_pose_deg, r.home_duration_sec, r.move_rate_hz)
+        self._sync_to_robot_pose(self.home_pose_deg)
+        self._self_check(self.home_pose_deg)
+        if inex_cfg.init_grippers:
+            fs = getattr(inex_cfg, "gripper_force_speed", None)
+            self.inex.init_grippers(publish_hz=int(inex_cfg.gripper_state_hz),
+                                    force_speed=None if fs is None else (int(fs[0]), int(fs[1])))
+
+        # 5. 安全门（质心 + 碰撞）
+        if cfg.safety.enable:
+            init_cmd = np.zeros(24)
+            init_cmd[:14] = self.home_pose_deg
+            init_cmd[14:22] = self._body_state_deg()
+            self.safety = SafetyGuard(
+                module_dir=cfg.safety.module_dir,
+                body_state_deg_getter=self._body_state_deg,
+                initial_cmd_deg=init_cmd,
+                enable_com_guard=cfg.safety.enable_com_guard,
+                enable_collision_guard=cfg.safety.enable_collision_guard,
+                check_rate_hz=cfg.safety.check_rate_hz,
+                warn_interval_sec=cfg.safety.warn_interval_sec,
+            )
+        else:
+            print("[Setup] ⚠️ 安全门已禁用（无质心/碰撞保护）")
+
+    def _self_check(self, expected_deg: np.ndarray) -> None:
+        fb = self.arm.get_arm_state_deg()
+        diff = np.max(np.abs(fb - expected_deg))
+        if diff > 10.0:
+            print(f"[Setup] ⚠️ 真机反馈与目标位姿最大偏差 {diff:.1f}°（>10°），请检查零位/方向标定\n"
+                  f"        反馈 L={np.round(fb[:7], 1)} R={np.round(fb[7:], 1)}")
+        else:
+            print(f"[Setup] 真机反馈与目标位姿最大偏差 {diff:.1f}°，一致")
+
+    def _should_keep_running(self) -> bool:
+        return super()._should_keep_running() and (self.ros is None or self.ros.ok())
+
+    def _shutdown_robot(self) -> None:
+        if self.recorder:
+            self.recorder.stop()
+        if self.chassis:
+            self.chassis.stop()
+        if self.safety:
+            self.safety.stop()
+        if self.inex and self.cfg.inex.halt_on_exit:
+            self.inex.halt()
+        if self.ros:
+            self.ros.shutdown()
+
+    # ------------------------------------------------------------------ #
+    # 输入
+    # ------------------------------------------------------------------ #
+    def _update_robot_state(self) -> None:
+        """开环虚拟机器人：不回读真机反馈。"""
+
+    def _read_arm_input(self, name: str) -> Tuple[bool, Optional[np.ndarray]]:
+        if self._resetting.is_set():
+            return False, None
+        side = _SIDE[name]
+        if self.external_input and self.external_input.enabled:
+            return self.external_input.read(side)
+        active, pose = super()._read_arm_input(name)
+        if self.lead_pub:
+            self.lead_pub.update_controller_pose(side, pose, active)
+        return active, pose
+
+    def _mode_switch_allowed(self) -> bool:
+        return not self._head_active
+
+    def _pre_ik_update(self) -> None:
+        if self._resetting.is_set():
+            return
+        self._handle_buttons()
+        self._update_head()
+        self._update_chassis()
+
+    # ------------------------------------------------------------------ #
+    # 按键：复位 / 腰
+    # ------------------------------------------------------------------ #
+    def _handle_buttons(self) -> None:
+        x = bool(self.xr_client.get_button_state_by_name("X"))
+        y = bool(self.xr_client.get_button_state_by_name("Y"))
+        if self._xy_edge(x and y):
+            self._start_reset()
+            return
+        if self._y_hold(y and not x):
+            self.waist.step(True)
+        if self._x_hold(x and not y):
+            self.waist.step(False)
+
+    def _start_reset(self) -> None:
+        if self._resetting.is_set():
+            return
+        self._resetting.set()
+        threading.Thread(target=self._do_reset, name="reset", daemon=True).start()
+
+    def _do_reset(self) -> None:
+        try:
+            print("[Reset] X+Y → 双臂复位")
+            r = self.cfg.robot
+            self._streaming = False
+            self.arm.move_to(self.reset_pose_deg, r.reset_duration_sec, r.move_rate_hz)
+            self._sync_to_robot_pose(self.reset_pose_deg)
+            self._self_check(self.reset_pose_deg)
+            print("[Reset] 完成")
+        except Exception as e:
+            print(f"[Reset] 异常: {e!r}")
+        finally:
+            self._resetting.clear()
+
+    # ------------------------------------------------------------------ #
+    # 头部
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _axis(raw: float, deadzone: float, invert: bool) -> float:
+        if abs(raw) < deadzone:
+            return 0.0
+        return -raw if invert else raw
+
+    def _update_head(self) -> None:
+        h = self.cfg.head
+        rt = self.xr_client.get_key_value_by_name("right_trigger")
+        lg = self.xr_client.get_key_value_by_name("left_grip")
+        rg = self.xr_client.get_key_value_by_name("right_grip")
+        self._head_active = rt >= h.trigger_threshold and lg < h.grip_release_threshold and rg < h.grip_release_threshold
+        if not self._head_active:
+            return
+        lx, ly = self.xr_client.get_joystick_state("left")
+        rx, _ = self.xr_client.get_joystick_state("right")
+        axes = [
+            self._axis(rx, h.deadzone, h.invert_yaw),     # head_j1 yaw
+            self._axis(ly, h.deadzone, h.invert_pitch),   # head_j2 pitch
+            self._axis(lx, h.deadzone, h.invert_roll),    # head_j3 roll
+        ]
+        if self.head.step_by(axes):
+            self.head.publish()
+
+    # ------------------------------------------------------------------ #
+    # 底盘
+    # ------------------------------------------------------------------ #
+    def _update_chassis(self) -> None:
+        c = self.cfg.chassis
+        lx, ly = self.xr_client.get_joystick_state("left")
+        rx, ry = self.xr_client.get_joystick_state("right")
+
+        if self._head_active:
+            self._base_up_edge(ry >= c.trigger_up)
+            self._base_down_edge(ry <= -c.trigger_down)
+            self.chassis.set_velocity_command(0.0, 0.0, 0.0)
+            return
+
+        if self._base_up_edge(ry >= c.trigger_up):
+            self.chassis.enable()
+        if self._base_down_edge(ry <= -c.trigger_down):
+            self.chassis.disable()
+
+        if self.chassis.enabled:
+            vx = self._axis(ly, c.deadzone, c.invert_linear_x) * c.max_linear
+            vy = self._axis(lx, c.deadzone, c.invert_linear_y) * c.max_linear
+            wz = self._axis(-rx, c.deadzone, c.invert_angular_z) * c.max_angular   # 左拨 = 逆时针为正
+            self.chassis.set_velocity_command(vx, vy, wz)
+
+    # ------------------------------------------------------------------ #
+    # 下发
+    # ------------------------------------------------------------------ #
+    def _limit_step(self, arm_deg: np.ndarray) -> np.ndarray:
+        prev = self.arm.last_cmd_deg
+        if prev is None:
+            return arm_deg
+        delta = arm_deg - prev
+        clipped = np.clip(delta, -self._max_step_deg, self._max_step_deg)
+        if self.prof_ctrl.enabled:
+            self.prof_ctrl.note("max_step_deg", f"{np.max(np.abs(delta)):.3f}")
+            self.prof_ctrl.note("clipped", int(np.any(clipped != delta)))
+        return prev + clipped
+
+    def _send_command(self) -> None:
+        if not self._resetting.is_set():
+            if any(self.active.values()):
+                self._streaming = True
+            if self._streaming:
+                # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
+                arm_deg = self._placo_to_deg14()
+                if self.safety:
+                    arm_deg = self.safety.filter(arm_deg)
+                if self.arm.planner is None:
+                    arm_deg = self._limit_step(arm_deg)
+                self.arm.publish_planned_cmd(arm_deg, self.dt)
+                self.prof_ctrl.note("pub", 1)
+                if self.arm.planner is not None and self.prof_ctrl.enabled:
+                    self.prof_ctrl.note("planner_limited", self.arm.planner.limited_frames)
+            if self._gripper_limiter.ready():
+                self.arm.publish_gripper_cmd(
+                    self.gripper_pos_target["left_arm"], self.gripper_pos_target["right_arm"]
+                )
+        self.chassis.publish()
+
+    # ------------------------------------------------------------------ #
+    # 辅助线程（30Hz）：数采按键 + 主端数据镜像
+    # ------------------------------------------------------------------ #
+    def _aux_update(self) -> None:
+        if self._a_edge(bool(self.xr_client.get_button_state_by_name("A"))):
+            self.recorder.start()
+        if self._b_edge(bool(self.xr_client.get_button_state_by_name("B"))):
+            self.recorder.stop()
+        self.lead_pub.publish(self.arm.last_cmd_deg, self.head.get_target())

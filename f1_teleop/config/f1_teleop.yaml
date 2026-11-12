@@ -1,0 +1,214 @@
+# ============================================================================
+# F1 轮式人形机器人（珞石 Rokae 双臂 + iNex ROS2 v1.0 驱动）遥操作配置（f1_rokae_teleop）
+# ----------------------------------------------------------------------------
+# 所有可调参数集中于此文件，改参数无需改代码。
+# 角度单位：驱动侧（/inex/servo_cmd q_deg、软限位、home/reset）一律为【度】；
+#           /inex/joint_states 反馈为【弧度】，由 InexArmController 统一转成度；
+#           Placo/URDF 侧一律为【弧度】。
+# ============================================================================
+
+robot:
+  # Placo IK 使用的 URDF（相对项目根目录，或绝对路径）。
+  # huaqin_20260924：关节名与 /inex/joint_states 的 22 轴原生名完全一致，臂关节限位 = 驱动软限位，
+  # 关节坐标 = 驱动坐标（joint_map 全为 sign=+1/offset=0）；flan_link 与驱动 TCP 位置 x/z 吻合（2026-11-12 实测）。
+  # 旧 assets/f1l01（lxl 珞石版）零位与真机差 180°、需要逐关节 sign/offset 映射，仅作参考保留。
+  urdf_path: assets/huaqin_20260924/urdf/huaqin_20260924.urdf
+
+  # 驱动侧关节名（本项目内部命名，用于限位表 / 日志；iNex 反馈按 left_N/right_N 前缀解析，不依赖此名）
+  left_joint_names:  [arm_l_j1, arm_l_j2, arm_l_j3, arm_l_j4, arm_l_j5, arm_l_j6, arm_l_j7]
+  right_joint_names: [arm_r_j1, arm_r_j2, arm_r_j3, arm_r_j4, arm_r_j5, arm_r_j6, arm_r_j7]
+  head_joint_names:  [head_j1, head_j2, head_j3]
+  body_joint_names:  [body_j1, body_j2, body_j3, body_j4, body_j5]
+
+  # URDF 关节名（Placo 内部使用；与 iNex 原生关节名一致）
+  urdf_left_joint_names:  [AR10-10_08L-W4C1C15_joint_1, AR10-10_08L-W4C1C15_joint_2, AR10-10_08L-W4C1C15_joint_3, AR10-10_08L-W4C1C15_joint_4, AR10-10_08L-W4C1C15_joint_5, AR10-10_08L-W4C1C15_joint_6, AR10-10_08L-W4C1C15_joint_7]
+  urdf_right_joint_names: [AR10-10_08R-W4C1C15_joint_1, AR10-10_08R-W4C1C15_joint_2, AR10-10_08R-W4C1C15_joint_3, AR10-10_08R-W4C1C15_joint_4, AR10-10_08R-W4C1C15_joint_5, AR10-10_08R-W4C1C15_joint_6, AR10-10_08R-W4C1C15_joint_7]
+
+  # 末端 link（IK frame task 目标）：法兰 link（link7 + 0.1105 m），与驱动 TCP（/inex/tcp_pose、dual_arm_pose）同点
+  left_ee_link:  AR10-10_08L-W4C1C15_flan_link
+  right_ee_link: AR10-10_08R-W4C1C15_flan_link
+  # 肩部 link（球形工作空间限制的球心，workspace_radius 为 null 时不用）
+  left_shoulder_link:  AR10-10_08L-W4C1C15_link1
+  right_shoulder_link: AR10-10_08R-W4C1C15_link1
+
+  # Placo 弧度 → 驱动度 的线性映射：deg = sign * rad2deg(rad) + offset_deg
+  # huaqin URDF 的关节坐标即驱动坐标，映射为恒等。
+  # ✅ 2026-11-12 ms-thor 实机 jog 逐轴验证（scripts/check_joint_map.py --mode jog，14 轴 × +5°）：
+  #    模型预测 vs 驱动 tcp_pose 实测，位移/旋转轴余弦全部 +1.00，位移误差 ≤ 0.3 mm。
+  joint_map:
+    left:
+      sign:       [ 1, 1, 1, 1, 1, 1, 1]
+      offset_deg: [ 0, 0, 0, 0, 0, 0, 0]
+    right:
+      sign:       [ 1, 1, 1, 1, 1, 1, 1]
+      offset_deg: [ 0, 0, 0, 0, 0, 0, 0]
+
+  # 启动回零位姿 / X+Y 复位位姿（驱动度，左臂 7 + 右臂 7）—— 与 lxl 珞石版 ip_config 一致
+  home_pose:
+    left:  [ 90.0, 90.0, -90.0, 90.0, 0.0, 0.0, 0.0]
+    right: [-90.0, 90.0,  90.0, 90.0, 0.0, 0.0, 0.0]
+  reset_pose:
+    left:  [ 90.0, 90.0, -90.0, 90.0, 0.0, 0.0, 0.0]
+    right: [-90.0, 90.0,  90.0, 90.0, 0.0, 0.0, 0.0]
+  home_duration_sec: 5.0    # 启动回零位 S 曲线时长（lxl 珞石版 5s）
+  reset_duration_sec: 2.0   # X+Y 复位 S 曲线时长
+  move_rate_hz: 50          # 回零/复位插值发布频率
+
+  # 驱动软限位回退表（度，驱动坐标，[lower, upper]；null=沿用 URDF）。
+  # 启动时会用 /inex/get_soft_limits 的实测值覆盖；查询失败才用此表。
+  # 下表 = 2026-11 在 ms-thor 上 /inex/get_soft_limits 实测值（左右臂相同）。
+  # 限位一律以驱动为准（不与 URDF <limit> 取交集；huaqin URDF 的限位本就等于驱动软限位）。
+  arm_joint_limits_deg:
+    arm_l_j1: [-360.0, 360.0]
+    arm_l_j2: [-125.0, 125.0]
+    arm_l_j3: [-178.0, 178.0]
+    arm_l_j4: [ -96.0, 140.0]
+    arm_l_j5: [-178.0, 178.0]
+    arm_l_j6: [ -60.0,  60.0]
+    arm_l_j7: [ -90.0,  90.0]
+    arm_r_j1: [-360.0, 360.0]
+    arm_r_j2: [-125.0, 125.0]
+    arm_r_j3: [-178.0, 178.0]
+    arm_r_j4: [ -96.0, 140.0]
+    arm_r_j5: [-178.0, 178.0]
+    arm_r_j6: [ -60.0,  60.0]
+    arm_r_j7: [ -90.0,  90.0]
+  soft_limit_margin_deg: 3.0   # 实测软限位内缩量（IK 解不贴着驱动极限）
+
+# ----------------------------------------------------------------------------
+ros:
+  node_name: f1_rokae_teleop
+  servo_cmd_topic:   /inex/servo_cmd                 # inex_ros2_interface/ServoCommand（ServoJ，度，SensorDataQoS）
+  joint_state_topic: /inex/joint_states              # sensor_msgs/JointState（弧度，body→head→left→right）
+  gripper_left_cmd_topic:  /motion_ctl/gripper/left  # control_msgs/GripperCommand，驱动内置夹爪组件消费（0 闭 ~ 100 开）
+  gripper_right_cmd_topic: /motion_ctl/gripper/right
+  waist_cmd_topic: /control/waist/updown             # std_msgs/Bool，True 升 / False 降（EC_Line_Control 节点 → /inex/move_to）
+  # 数采镜像（主端数据）
+  lead_joint_state_topic: /lead/joint_states         # 17 关节：urdf_left/right_joint_names(14) + head_j1..3（度）
+  lead_left_tcp_topic:  /lead/left_tcp               # PICO 手柄位姿 [x,y,z,rx,ry,rz]，frame_id press_pico/un_press_pico
+  lead_right_tcp_topic: /lead/right_tcp
+  lead_publish_rate_hz: 30.0
+  # 外部位姿回放（可选）：为 True 时用下列 topic 替代 XR 手柄作为双臂输入
+  replay_mode_topic: /lead_tcp/replay_mode           # std_msgs/Bool
+  replay_left_tcp_topic:  /lead/left_tcp_control
+  replay_right_tcp_topic: /lead/right_tcp_control
+  # 外部相机录制器启停信号（std_msgs/String）
+  tianji_start_topic: /tianji/start_recording
+  tianji_stop_topic:  /tianji/stop_recording
+
+# ----------------------------------------------------------------------------
+# iNex 驱动相关（对应 lxl init_f1 / send2real_robot_f1_udp2topic 的参数）
+inex:
+  service_timeout_sec: 3.0            # 等待 /inex/* 服务可用
+  state_timeout_sec: 5.0              # 等待首帧 /inex/joint_states
+  servo_subscriber_timeout_sec: 3.0   # 等待驱动订阅 /inex/servo_cmd（DDS 发现需数百 ms）
+  require_powered: true               # 双臂上电复核失败则终止启动（false=仅告警）
+  init_grippers: true                 # 回零后调用 /inex/init_gripper（需双臂已上电）
+  gripper_state_hz: 30                # /inex/set_gripper_publish_frequency
+  gripper_force_speed: null           # [force 20~100, speed 1~100]；null=沿用驱动默认
+  halt_on_exit: true                  # 退出时 /inex/halt(part=0xFF) 平滑制动（不下电）
+  # ServoJ 输出规划器（对应 lxl 桥接 send_loop）。天机版只靠末端摆率 + Placo 速度限制就够，
+  # 珞石 iNex ServoJ 是位置流，lxl 注释反复强调"防底层报警"，故保留一层加速度/速度兑底：
+  #   mode: clamp    = 只在超 vmax/amax 时夹住，不触限时输出恒等于 IK 目标，零附加延迟（默认）
+  #   mode: tracking = lxl 原版一阶跟踪（τ 0.04/0.25 + 制动前瞻），自带 ≈40 ms 滞后，回退用
+  #   enable: false / --no-planner = 完全关闭，仅靠摆率 + Placo 速度限制（与天机版一致）
+  # 上机顺序建议 tracking → clamp → 关闭，看 /inex/system_status.state 是否进 ERROR。
+  servo_planner:
+    enable: true
+    mode: clamp
+    vmax_deg_s: 90.0        # 最大关节速度（lxl 实测 60→90）
+    amax_deg_s2: 300.0      # 最大加速度（起步 0.24s 到 90°/s）
+    tau_fast_sec: 0.04      # tracking 模式：大误差响应时间常数
+    tau_slow_sec: 0.25      # tracking 模式：小误差收敛时间常数
+    gate_deg: 1.5           # tracking 模式：τ 过渡宽度
+
+# ----------------------------------------------------------------------------
+teleop:
+  control_rate_hz: 100       # IK 与下发线程频率（ServoJ 10~1000Hz 均可）
+  scale_factor: 1.5          # 手柄位移 → 末端位移放大倍数
+  grip_activate_threshold: 0.9   # 握把 > 该值视为激活该臂
+  ik:
+    frame_task_weight: 10.0
+    manipulability_weight: 1.0e-4
+    joint_regularization_weight: 1.0
+    # 用 URDF <limit velocity> 约束 QP：大跳变时所有关节按比例减速，末端路径不扭曲
+    enable_joint_velocity_limits: true
+    # 位置限位模式：clamp = 求解后按 q 索引钳位（lxl 在本 URDF 上实测 Placo 内置限位错位，J7 套用了夹爪限位）
+    #              qp    = 交给 Placo QP（换 URDF 后可改回）
+    joint_limit_mode: clamp
+  # 末端目标摆率限制（PICO 数据流冻结恢复时位姿一次性跳几十厘米 → 摆成限速追赶）；null=不限制
+  max_ee_speed_m_s: 1.5
+  max_ee_ang_speed_rad_s: 4.0
+  workspace_radius: null     # 球形工作空间半径（m，球心为肩部 link）；null 不限制
+  # 下发每关节最大速度（°/s）：仅在 servo_planner.enable=false 时生效（规划器已含 vmax/amax）
+  max_joint_speed_deg_s: 360.0
+  gripper:
+    open_cmd: 100.0          # trigger=0 → 张开
+    close_cmd: 0.0           # trigger=1 → 闭合
+    max_effort: 15.0
+    publish_rate_hz: 30.0
+  waist_button_hold_sec: 0.3 # Y/X 长按确认时间，避免与 X+Y 复位误触
+
+# ----------------------------------------------------------------------------
+head:
+  enable: false                  # true = 头部摇杆模式下发 ServoJ part=3（需机器人模式含头部、头部已上电）；lxl 珞石版无头部控制
+  servo_axes: 6                  # 驱动 head 缓冲长度（v1.0 为 6，不足补零）
+  trigger_threshold: 0.5         # 右扳机 >= 该值进入头部模式
+  grip_release_threshold: 0.1    # 双臂握把均 < 该值（未在控臂）
+  deadzone: 0.1
+  step_deg_per_frame: 0.3        # 每帧最大增量（100Hz 下约 30°/s）
+  limits_deg:                    # [yaw(head_j1), pitch(head_j2), roll(head_j3)]
+    - [-40.0, 40.0]
+    - [-25.0, 25.0]
+    - [-15.0, 15.0]
+  invert_yaw: true
+  invert_pitch: true
+  invert_roll: true
+
+# ----------------------------------------------------------------------------
+chassis:                                   # 底盘未变，与 f1_tianji_teleop 相同
+  move_topic: /move/ManualMoveCmd          # geometry_msgs/TwistStamped
+  control_mode_service: /move/SetControlMode   # move/srv/SetControlMode（interface_20260623）
+  control_mode_value: 1
+  frame_id: base_link
+  publish_rate_hz: 30.0
+  deadzone: 0.1
+  max_linear: 0.8      # m/s
+  max_angular: 0.5     # rad/s
+  trigger_up: 0.8      # 右摇杆上拨 >= 该值 → 使能
+  trigger_down: 0.8    # 右摇杆下拨 <= -该值 → 解除并刹车
+  invert_linear_x: false
+  invert_linear_y: true
+  invert_angular_z: false
+
+# ----------------------------------------------------------------------------
+safety:
+  # cyb SafetyProtector 的模型为天机双臂 F1（f1_wheel URDF），与珞石臂几何不一致；
+  # lxl 珞石版仍开着质心保护（use_com_guard=True）。默认关闭，确认模型适配后再开。
+  enable: false
+  enable_com_guard: true           # 质心保护
+  enable_collision_guard: false    # 手臂-机身碰撞检测
+  module_dir: /home/user/cyb_safe_control_real/cyb_dist/src/python
+  check_rate_hz: 15.0
+  warn_interval_sec: 3.0
+  body_joint_order_reversed: true  # lxl 珞石版（2026-10-16）确认 SafetyProtector 腰段为 j5..j1 反序
+
+# ----------------------------------------------------------------------------
+recording:
+  enable: true
+  bag_dir: data/all_data           # ros2 bag 输出目录（episode_XXXXXX）；相对项目根目录
+  storage: mcap
+  validate: true                   # 开始前检查 topic 发布者 / 结束后校验消息数
+  topics:
+    - /inex/joint_states
+    - /motion_ctl/gripper/left/state
+    - /motion_ctl/gripper/right/state
+    - /camera/left_wrist/color/image_raw/compressed
+    - /camera/right_wrist/color/image_raw/compressed
+    # - /camera/head/color/image_raw/compressed   # 2026-11 实测 ms-thor 无头部彩色话题（仅 device_status），需要时再启用
+    - /lead/joint_states
+    - /motion_ctl/gripper/left
+    - /motion_ctl/gripper/right
+    - /lead/left_tcp
+    - /lead/right_tcp
+    - /move/State
