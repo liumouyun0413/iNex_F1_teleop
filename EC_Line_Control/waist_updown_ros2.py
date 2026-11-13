@@ -52,6 +52,7 @@ from inex_ros2_interface.action import MoveTo
 from inex_ros2_interface.srv import (
     Halt,
     JointPublish,
+    OperationState,
     PowerChange,
     RobotMode,
     SetMotionProfile,
@@ -130,6 +131,16 @@ MOTION_PROFILE_JOINT_POSITION = 1
 # /inex/move_to action motion_type: JOINT(0) interpolates in joint space (the
 # controller plans the accel/decel); CARTESIAN(1) would need a 7-D pose.
 MOTION_TYPE_JOINT = 0
+# RobotSystemState.ERROR: power_on retries from ERROR back to READY (SDK state
+# table); any rejected PTP (e.g. soft-limit) can leave the system here.
+SYSTEM_STATE_ERROR = 3
+# robot_manager_user_error.h codes seen in MoveTo results.
+PTP_ERROR_HINTS = {
+    40002: 'SoftLimit: start or target outside the driver soft limits '
+           '(check /inex/get_soft_limits part=0 vs. measured body joints)',
+    41020: 'MotionRejected: system not READY (ERROR / busy); cleared on next '
+           'command via power_on retry',
+}
 
 CONFIG_PATH = Path(__file__).with_name('waist_updown_config.ini')
 
@@ -325,6 +336,9 @@ class WaistUpDownController(Node):
             JointPublish, '/inex/joint_publish'
         )
         self.cli_halt = self.create_client(Halt, '/inex/halt')
+        self.cli_op_state = self.create_client(
+            OperationState, '/inex/operation_state'
+        )
         # JOINT PTP action client: the controller plans and executes the move.
         self.act_move_to = ActionClient(self, MoveTo, '/inex/move_to')
         self._goal_handle = None
@@ -506,6 +520,28 @@ class WaistUpDownController(Node):
             self.get_logger().info('躯干已平滑制动')
         if self._powered:
             self._set_power(False)
+
+    def _recover_from_error(self) -> bool:
+        """If the driver is in ERROR, retry power_on on the body group to clear it."""
+        res = self._call_service(
+            self.cli_op_state, OperationState.Request(), wait=True
+        )
+        if res is None or res.code != 0 or res.state != SYSTEM_STATE_ERROR:
+            return True
+        self.get_logger().warning(
+            '驱动处于 ERROR 状态（上次运动被拒），用 power_on 重试清错...'
+        )
+        if not self._set_power(True):
+            return False
+        res = self._call_service(
+            self.cli_op_state, OperationState.Request(), wait=True
+        )
+        ok = res is not None and res.code == 0 and res.state != SYSTEM_STATE_ERROR
+        self.get_logger().info(
+            'ERROR %s (state=%s)' % ('已清除' if ok else '未清除',
+                                   getattr(res, 'state', 'NA'))
+        )
+        return ok
 
     def _set_power(self, power_on: bool) -> bool:
         req = PowerChange.Request()
@@ -782,6 +818,11 @@ class WaistUpDownController(Node):
                             % direction_name
                         )
                         return
+                if not self._recover_from_error():
+                    self.get_logger().error(
+                        '%s move aborted: driver stuck in ERROR.' % direction_name
+                    )
+                    return
             if not self.act_move_to.wait_for_server(self.service_timeout_s):
                 self.get_logger().error(
                     '%s move aborted: /inex/move_to action server unavailable.'
@@ -854,12 +895,14 @@ class WaistUpDownController(Node):
                     % direction_name
                 )
             else:
+                code = getattr(res, 'code', None)
                 self.get_logger().error(
-                    '%s move aborted: PTP result success=%s code=%s message=%s.'
+                    '%s move aborted: PTP result success=%s code=%s message=%s. %s'
                     % (direction_name,
                        getattr(res, 'success', None),
-                       getattr(res, 'code', None),
-                       getattr(res, 'message', ''))
+                       code,
+                       getattr(res, 'message', ''),
+                       PTP_ERROR_HINTS.get(code, ''))
                 )
         finally:
             self._goal_handle = None

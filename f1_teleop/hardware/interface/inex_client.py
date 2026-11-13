@@ -64,6 +64,11 @@ ROBOT_MODE_WHOLE_BODY = 3
 # ---- MotionProfile / MotionServoMode ----
 PROFILE_JOINT_POSITION = 1
 SERVO_MODE_J = 4
+# ---- RobotSystemStatus.state ----
+STATE_IDLE, STATE_READY, STATE_RUNNING, STATE_ERROR = 0, 1, 2, 3
+# ---- 驱动常见拒绝码（robot_manager_user_error.h）----
+ERR_SOFT_LIMIT = 40002
+ERR_MOTION_REJECTED = 41020
 
 PART_NAME = {PART_BODY: "躯干", PART_LEFT_ARM: "左臂", PART_RIGHT_ARM: "右臂", PART_HEAD: "头部"}
 
@@ -88,6 +93,7 @@ class InexClient:
 
         self._powered_mask: Optional[int] = None
         self._robot_mode_cache: Optional[int] = None
+        self._state: Optional[int] = None
         node.create_subscription(RobotSystemStatus, "/inex/system_status", self._on_status, 10)
 
     # ------------------------------------------------------------------ #
@@ -96,6 +102,7 @@ class InexClient:
     def _on_status(self, msg: RobotSystemStatus) -> None:
         self._powered_mask = int(msg.powered_mask)
         self._robot_mode_cache = int(msg.robot_mode)
+        self._state = int(msg.state)
 
     def _call(self, client, request, name: str, timeout: Optional[float] = None):
         """同步服务调用；服务不可用或超时返回 None（应答由 RosContext 的 spin 线程处理）。"""
@@ -125,6 +132,24 @@ class InexClient:
             time.sleep(0.05)
         return self._powered_mask
 
+    @property
+    def state(self) -> Optional[int]:
+        return self._state
+
+    def recover_from_error(self, group: int = GROUP_LEFT_ARM) -> bool:
+        """state==ERROR 时用 power_on 重试清错（SDK 状态表：ERROR → power_on → READY）；非 ERROR 直接返回 True。"""
+        if self._state != STATE_ERROR:
+            return True
+        print("[iNex] ⚠️ 系统处于 ERROR（上次运动被拒/故障），用 power_on 重试清错...")
+        req = PowerChange.Request(); req.power_on = True; req.group = group
+        res = self._call(self._power_change, req, "power_change", timeout=30.0)
+        deadline = time.monotonic() + 3.0
+        while self._state == STATE_ERROR and time.monotonic() < deadline:
+            time.sleep(0.05)
+        ok = res is not None and res.code == 0 and self._state != STATE_ERROR
+        print(f"[iNex] {'✅ ERROR 已清除' if ok else '❌ ERROR 未清除'} code={self._code(res)} state={self._state}")
+        return ok
+
     # ------------------------------------------------------------------ #
     # 准备时序（lxl init_f1._prepare_system 的等价实现）
     # ------------------------------------------------------------------ #
@@ -133,6 +158,8 @@ class InexClient:
         res = self._call(self._stop_heartbeat, StopSinglePointHeartbeat.Request(), "stop_single_point_heartbeat")
         print(f"[iNex] 关闭单点心跳 code={self._code(res)}")
 
+        self.powered_mask()  # 等首帧 system_status，顺带拿到 state
+        self.recover_from_error()
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
         for part in parts:
