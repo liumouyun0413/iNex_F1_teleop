@@ -102,20 +102,27 @@ class ServoJPlanner:
         self.vel = np.zeros(n)
         self._prev_target: Optional[np.ndarray] = None
         self._v_target = np.zeros(n)
-        self.limited_frames = 0          # 被夹住的帧计数（诊断用）        # 位置限位（驱动度）与接近限位时的速度前瞻时间：驱动 ServoJ 内部滤波有 ≈80 ms 滞后且会超调，
+        self.limited_frames = 0          # 被夾住的帧计数（诊断用）
+        # 位置限位（驱动度）与接近限位时的速度前瞻：驱动 ServoJ 内部滤波有 ≈80 ms 滞后且会超调，
         # 快速反向时反馈可超出指令 ≈ v·τ（2026-11-13 实测 255°/s → +15°，撞软限位掉电）。
-        # 因此要求 pos + v·(dt+lead) 不越限：距限位越近允许速度越小。
+        # 要求 pos + v·(dt+lead) 不超出 [lo-buffer, hi+buffer]：buffer = 钳位到软限位的内缩量，
+        # 这样只在离限位很近时才限速，而不是全程按 距离/lead 压速度。
         self._lo: Optional[np.ndarray] = None
         self._hi: Optional[np.ndarray] = None
         self.limit_lead = 0.0
+        self.limit_buffer = 0.0
+        self.limit_clip_frames = np.zeros(n, dtype=int)   # 逐轴：被限位前瞻夾速的帧数（诊断）
+
     @property
     def anchored(self) -> bool:
         return self.pos is not None
 
-    def set_position_limits(self, lo_deg: Sequence[float], hi_deg: Sequence[float], lead_sec: float) -> None:
+    def set_position_limits(self, lo_deg: Sequence[float], hi_deg: Sequence[float], lead_sec: float,
+                            buffer_deg: float = 0.0) -> None:
         self._lo = np.asarray(lo_deg, dtype=float).copy()
         self._hi = np.asarray(hi_deg, dtype=float).copy()
         self.limit_lead = max(0.0, float(lead_sec))
+        self.limit_buffer = max(0.0, float(buffer_deg))
 
     def _per_joint(self, value) -> np.ndarray:
         arr = np.atleast_1d(np.asarray(value, dtype=float))
@@ -162,7 +169,10 @@ class ServoJPlanner:
         v = np.clip(v, self.vel - self.amax * dt, self.vel + self.amax * dt)
         if self._lo is not None:
             horizon = dt + self.limit_lead
-            v = np.clip(v, (self._lo - self.pos) / horizon, (self._hi - self.pos) / horizon)
+            v_lim = np.clip(v, (self._lo - self.limit_buffer - self.pos) / horizon,
+                            (self._hi + self.limit_buffer - self.pos) / horizon)
+            self.limit_clip_frames += (np.abs(v_lim - v) > 1e-9)
+            v = v_lim
         if np.any(np.abs(v - err / dt) > 1e-9):
             self.limited_frames += 1
         self.vel = v

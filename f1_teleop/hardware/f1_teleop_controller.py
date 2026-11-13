@@ -203,8 +203,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
             b = self.joint_map[arm].rad_to_deg(hi)
             lo14.append(np.minimum(a, b)); hi14.append(np.maximum(a, b))
         lead = float(getattr(self.cfg.inex.servo_planner, "limit_lead_sec", 0.0))
-        self.arm.planner.set_position_limits(np.concatenate(lo14), np.concatenate(hi14), lead)
-        print(f"[Setup] 规划器位置限位已设（驱动度，前瞻 {lead*1000:.0f} ms）")
+        buf = float(getattr(self.cfg.robot, "soft_limit_margin_deg", 0.0))
+        self.arm.planner.set_position_limits(np.concatenate(lo14), np.concatenate(hi14), lead, buf)
+        print(f"[Setup] 规划器位置限位已设（驱动度，前瞻 {lead*1000:.0f} ms，软限位内缩 {buf:.0f}°）")
 
     def _apply_runtime_soft_limits(self) -> None:
         """用 /inex/get_soft_limits 的实测软限位覆盖配置表（查询失败则保留配置表）。"""
@@ -560,6 +561,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 self.prof_ctrl.note("pub", 1)
                 if self.arm.planner is not None and self.prof_ctrl.enabled:
                     self.prof_ctrl.note("planner_limited", self.arm.planner.limited_frames)
+                    self.prof_ctrl.note("limit_clip_L", self.arm.planner.limit_clip_frames[:7].tolist())
+                    self.prof_ctrl.note("limit_clip_R", self.arm.planner.limit_clip_frames[7:].tolist())
             if self._gripper_limiter.ready():
                 self.arm.publish_gripper_cmd(
                     self.gripper_pos_target["left_arm"], self.gripper_pos_target["right_arm"]
