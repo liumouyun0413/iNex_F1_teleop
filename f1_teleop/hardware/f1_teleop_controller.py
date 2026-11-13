@@ -323,6 +323,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if not self.inex.prepare_arms():
             if inex_cfg.require_powered:
                 raise RuntimeError("双臂上电复核失败（inex.require_powered=true），终止启动")
+        if self.inex.state == 3:
+            raise RuntimeError("驱动仍处于 ERROR，回零/ServoJ 会被拒绝，终止启动（请在 UI 做报警复位后重试）")
         self.arm.wait_servo_subscriber(timeout=inex_cfg.servo_subscriber_timeout_sec)
         self._apply_runtime_soft_limits()
 

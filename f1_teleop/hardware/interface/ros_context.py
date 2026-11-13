@@ -12,12 +12,15 @@ import threading
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 
 
 class RosContext:
     def __init__(self, node_name: str = "f1_teleop") -> None:
         if not rclpy.ok():
-            rclpy.init(args=None)
+            # 不让 rclpy 接管 SIGINT：否则 Ctrl+C/stop 脚本一到，context 立刻失效，停机流程里的 /inex/halt 发不出去，
+            # ServoJ 流在运动中被硕生生掉线 → 驱动进 ERROR（2026-11-13 实测）。主线程靠 KeyboardInterrupt/SIGTERM 退出。
+            rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
         self.node = Node(node_name)
         self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self.node)

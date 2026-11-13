@@ -10,6 +10,7 @@ HardwareTeleopController —— 真机遥操作多线程骨架。
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -143,6 +144,10 @@ class HardwareTeleopController(BaseTeleopController, ABC):
             t.start()
 
         print("[Teleop] 运行中，Ctrl+C 退出")
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: self._stop_event.set())
+        except (ValueError, OSError):
+            pass  # 非主线程时不装 handler
         try:
             while self._should_keep_running():
                 if not all(t.is_alive() for t in threads):

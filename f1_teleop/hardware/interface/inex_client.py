@@ -26,6 +26,7 @@ try:
         GetCollisionConfig,
         GetSoftLimits,
         Halt,
+        HotReset,
         InitGripper,
         PowerChange,
         RobotMode,
@@ -69,6 +70,7 @@ STATE_IDLE, STATE_READY, STATE_RUNNING, STATE_ERROR = 0, 1, 2, 3
 # ---- 驱动常见拒绝码（robot_manager_user_error.h）----
 ERR_SOFT_LIMIT = 40002
 ERR_MOTION_REJECTED = 41020
+ERR_BUSY = 10034
 
 PART_NAME = {PART_BODY: "躯干", PART_LEFT_ARM: "左臂", PART_RIGHT_ARM: "右臂", PART_HEAD: "头部"}
 
@@ -85,6 +87,7 @@ class InexClient:
         self._set_servo_mode = node.create_client(SetMotionServoMode, "/inex/set_motion_servo_mode")
         self._stop_heartbeat = node.create_client(StopSinglePointHeartbeat, "/inex/stop_single_point_heartbeat")
         self._halt = node.create_client(Halt, "/inex/halt")
+        self._hot_reset = node.create_client(HotReset, "/inex/hot_reset")
         self._soft_limits = node.create_client(GetSoftLimits, "/inex/get_soft_limits")
         self._init_gripper = node.create_client(InitGripper, "/inex/init_gripper")
         self._gripper_freq = node.create_client(SetGripperPublishFrequency, "/inex/set_gripper_publish_frequency")
@@ -137,18 +140,36 @@ class InexClient:
         return self._state
 
     def recover_from_error(self, group: int = GROUP_LEFT_ARM) -> bool:
-        """state==ERROR 时用 power_on 重试清错（SDK 状态表：ERROR → power_on → READY）；非 ERROR 直接返回 True。"""
+        """state==ERROR 时清错。实测有效顺序（2026-11-13）：hot_reset（= UI「报警复位」，清伺服故障/闩锁）
+        → 逐臂 power_on（Busy 10034 则稍等重试）。单纯 power_on / power_off→on 都不能清掉伺服故障。"""
         if self._state != STATE_ERROR:
             return True
-        print("[iNex] ⚠️ 系统处于 ERROR（上次运动被拒/故障），用 power_on 重试清错...")
-        req = PowerChange.Request(); req.power_on = True; req.group = group
-        res = self._call(self._power_change, req, "power_change", timeout=30.0)
+        print("[iNex] ⚠️ 系统处于 ERROR（上次运动被拒/故障），执行报警复位 hot_reset...")
+        res = self._call(self._hot_reset, HotReset.Request(), "hot_reset", timeout=40.0)
+        print(f"[iNex] hot_reset code={self._code(res)}")
+        time.sleep(1.0)
+        ok = True
+        for g in (GROUP_LEFT_ARM, GROUP_RIGHT_ARM):
+            ok &= self._power_on_retry(g)
         deadline = time.monotonic() + 3.0
         while self._state == STATE_ERROR and time.monotonic() < deadline:
             time.sleep(0.05)
-        ok = res is not None and res.code == 0 and self._state != STATE_ERROR
-        print(f"[iNex] {'✅ ERROR 已清除' if ok else '❌ ERROR 未清除'} code={self._code(res)} state={self._state}")
+        ok = ok and self._state != STATE_ERROR
+        print(f"[iNex] {'✅ ERROR 已清除' if ok else '❌ ERROR 仍未清除，请在 UI 做报警复位/检查驱动日志'} state={self._state}")
         return ok
+
+    def _power_on_retry(self, group: int, attempts: int = 3) -> bool:
+        for i in range(attempts):
+            req = PowerChange.Request(); req.power_on = True; req.group = group
+            res = self._call(self._power_change, req, "power_change", timeout=30.0)
+            code = None if res is None else int(res.code)
+            print(f"[iNex] power_on group={group} code={self._code(res)}")
+            if code == 0:
+                return True
+            if code != ERR_BUSY:
+                return False
+            time.sleep(1.5)   # Busy：上一组上电/复位尚未完成
+        return False
 
     # ------------------------------------------------------------------ #
     # 准备时序（lxl init_f1._prepare_system 的等价实现）
