@@ -94,21 +94,28 @@ FEEDBACK_IN_RADIANS = True
 # this robot: its body_joint_3 range is mostly positive, so capping it at 0
 # rejected every trajectory at the current pose (+0.01 deg reads as over-limit).
 #
-# Start limits add a small positive tolerance to accept measured feedback
-# overshoot; end limits are the strict soft limits applied to all newly
-# planned command points.  The motor numbers map directly as body_joint_1=m1,
+# Start limits add a tolerance to accept measured feedback overshoot; end
+# limits are the strict soft limits applied to all newly planned command
+# points.  The motor numbers map directly as body_joint_1=m1,
 # body_joint_2=m2, body_joint_3=m3, so trajectory tuples are ordered
 # (m1, m2, m3) to line up with COMMAND_JOINT_NAMES.
-JOINT_LIMITS_S_DEG = {
-    'body_joint_1': (-36.0, 1.0),
-    'body_joint_2': (-94.0, 1.0),
-    'body_joint_3': (-5.0, 89.0),
-}
+#
+# 2026-11-13 on ms-thor: the waist parked at the mechanical end reads
+# body_joint_2 = +1.04 deg (soft limit 0), so a 1.0 deg tolerance rejected
+# every command ("Rejected start check").  The end target is still checked
+# against the strict limits, so a JOINT PTP from a slightly over-limit start
+# can only move back inside the range; a wider start tolerance is safe.
+START_TOLERANCE_DEG = 3.0
 
 JOINT_LIMITS_E_DEG = {
     'body_joint_1': (-36.0, 0.0),
     'body_joint_2': (-94.0, 0.0),
     'body_joint_3': (-5.0, 88.0),
+}
+
+JOINT_LIMITS_S_DEG = {
+    name: (lo - START_TOLERANCE_DEG, hi + START_TOLERANCE_DEG)
+    for name, (lo, hi) in JOINT_LIMITS_E_DEG.items()
 }
 
 # iNex interface enums (see inex_ros2_interface/srv definitions).
