@@ -86,14 +86,15 @@ class ServoJPlanner:
     MODE_TRACKING = "tracking"
     _VT_ALPHA = 0.5          # 目标速度 EMA（PICO 87Hz vs 控制 100Hz 的重复/跳帧抖动）
 
-    def __init__(self, n: int, vmax_deg_s: float, amax_deg_s2: float,
+    def __init__(self, n: int, vmax_deg_s, amax_deg_s2,
                  tau_fast: float, tau_slow: float, gate_deg: float, mode: str = MODE_CLAMP) -> None:
         if mode not in (self.MODE_CLAMP, self.MODE_TRACKING):
             raise ValueError(f"ServoJPlanner mode 应为 {self.MODE_CLAMP!r} 或 {self.MODE_TRACKING!r}")
         self.n = n
         self.mode = mode
-        self.vmax = float(vmax_deg_s)
-        self.amax = float(amax_deg_s2)
+        # 标量 = 所有轴同限；长度 n 或 n/2（单臂 7 轴，左右复用）= 逐轴限
+        self.vmax = self._per_joint(vmax_deg_s)
+        self.amax = self._per_joint(amax_deg_s2)
         self.tau_fast = float(tau_fast)
         self.tau_slow = float(tau_slow)
         self.gate = max(1e-6, float(gate_deg))
@@ -101,11 +102,30 @@ class ServoJPlanner:
         self.vel = np.zeros(n)
         self._prev_target: Optional[np.ndarray] = None
         self._v_target = np.zeros(n)
-        self.limited_frames = 0          # 被夹住的帧计数（诊断用）
-
+        self.limited_frames = 0          # 被夹住的帧计数（诊断用）        # 位置限位（驱动度）与接近限位时的速度前瞻时间：驱动 ServoJ 内部滤波有 ≈80 ms 滞后且会超调，
+        # 快速反向时反馈可超出指令 ≈ v·τ（2026-11-13 实测 255°/s → +15°，撞软限位掉电）。
+        # 因此要求 pos + v·(dt+lead) 不越限：距限位越近允许速度越小。
+        self._lo: Optional[np.ndarray] = None
+        self._hi: Optional[np.ndarray] = None
+        self.limit_lead = 0.0
     @property
     def anchored(self) -> bool:
         return self.pos is not None
+
+    def set_position_limits(self, lo_deg: Sequence[float], hi_deg: Sequence[float], lead_sec: float) -> None:
+        self._lo = np.asarray(lo_deg, dtype=float).copy()
+        self._hi = np.asarray(hi_deg, dtype=float).copy()
+        self.limit_lead = max(0.0, float(lead_sec))
+
+    def _per_joint(self, value) -> np.ndarray:
+        arr = np.atleast_1d(np.asarray(value, dtype=float))
+        if arr.size == 1:
+            return np.full(self.n, float(arr[0]))
+        if arr.size * 2 == self.n:
+            return np.tile(arr, 2)
+        if arr.size != self.n:
+            raise ValueError(f"ServoJPlanner 限幅长度应为 1、{self.n // 2} 或 {self.n}，得到 {arr.size}")
+        return arr.copy()
 
     def anchor(self, pos_deg: Sequence[float]) -> None:
         self.pos = np.asarray(pos_deg, dtype=float).copy()
@@ -140,10 +160,15 @@ class ServoJPlanner:
             v_des = np.clip(err / tau, -v_brake, v_brake)
         v = np.clip(v_des, -self.vmax, self.vmax)
         v = np.clip(v, self.vel - self.amax * dt, self.vel + self.amax * dt)
+        if self._lo is not None:
+            horizon = dt + self.limit_lead
+            v = np.clip(v, (self._lo - self.pos) / horizon, (self._hi - self.pos) / horizon)
         if np.any(np.abs(v - err / dt) > 1e-9):
             self.limited_frames += 1
         self.vel = v
         self.pos = self.pos + v * dt
+        if self._lo is not None:
+            self.pos = np.clip(self.pos, self._lo, self._hi)
         return self.pos.copy()
 
 

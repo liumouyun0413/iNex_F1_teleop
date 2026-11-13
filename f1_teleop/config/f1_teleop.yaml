@@ -116,8 +116,17 @@ inex:
   servo_planner:
     enable: true
     mode: clamp
-    vmax_deg_s: 90.0        # 最大关节速度（lxl 实测 60→90）
-    amax_deg_s2: 300.0      # 最大加速度（起步 0.24s 到 90°/s）
+    # 2026-11-13 ms-thor 两段 90s 遥操记录：
+    #  标量 90/300 时 97% 运动帧贴加速度限，末端速度只有手柄×1.5 的 0.35~0.45，滞后 ≈300 ms；
+    #  标量 150/600 时左臂路程比 0.63→0.91、滞后 320→190 ms，但 J4（肘）IK 需求 p90 150~180°/s 仍被夾。
+    # 改为逐轴限幅 ≈ 驱动自身限幅（/inex/get_motion_limits：vel [175,175,270,300,240,240,240]，
+    # acc [900,700,2000,3000,5000,5000,5000]）的 ~85%；支持标量 / 7 轴（左右共用）/ 14 轴。
+    vmax_deg_s:  [150, 150, 230, 200, 200, 200, 200]
+    amax_deg_s2: [750, 600, 1700, 1500, 4000, 4000, 4000]
+    # 接近软限位的速度前瞻：要求 pos + v·(dt+lead) 不越限，距限位 d 时允许速度 ≤ d/lead。
+    # 2026-11-13 实测：驱动 ServoJ 对 255°/s 快速反向超调 +15°（指令 126°、反馈 141.5°）撞 R-J4 软限位 140 → 整机掉电。
+    # 越限量 ≈ v×驱动滞后(≈80 ms)，lead 0.2 s 使在 3° 钳位边界处速度 ≤ 15°/s，超调 ≤ 1.2°。
+    limit_lead_sec: 0.2
     tau_fast_sec: 0.04      # tracking 模式：大误差响应时间常数
     tau_slow_sec: 0.25      # tracking 模式：小误差收敛时间常数
     gate_deg: 1.5           # tracking 模式：τ 过渡宽度
@@ -131,8 +140,11 @@ teleop:
     frame_task_weight: 10.0
     manipulability_weight: 1.0e-4
     joint_regularization_weight: 1.0
-    # 用 URDF <limit velocity> 约束 QP：大跳变时所有关节按比例减速，末端路径不扭曲
+    # 用关节速度上限约束 QP：大跳变时所有关节按比例减速，末端路径不扭曲
     enable_joint_velocity_limits: true
+    # QP 关节速度上限（°/s，7 轴左右共用；null = 沿用 URDF 的 180°/s）。
+    # 与 servo_planner.vmax 一致：IK 不会要求规划器给不出的速度，规划器只剩加速度兑底。
+    joint_velocity_limits_deg_s: [150, 150, 230, 200, 200, 200, 200]
     # 位置限位模式：clamp = 求解后按 q 索引钳位（lxl 在本 URDF 上实测 Placo 内置限位错位，J7 套用了夹爪限位）
     #              qp    = 交给 Placo QP（换 URDF 后可改回）
     joint_limit_mode: clamp

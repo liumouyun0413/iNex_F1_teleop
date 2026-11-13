@@ -190,9 +190,25 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print(f"[Placo] {real_name} 限位 驱动[{d_lo:.1f}, {d_hi:.1f}]° = URDF[{np.rad2deg(lo):.1f}, {np.rad2deg(hi):.1f}]°")
         for arm, (lo, hi) in new_limits.items():
             self.set_arm_joint_limits(arm, lo, hi)
+        self._apply_planner_position_limits()
+
+    def _apply_planner_position_limits(self) -> None:
+        """把当前臂限位（Placo 弧度）换成驱动度写入规划器：接近限位时限速 + 硬钳位。"""
+        if getattr(self, "arm", None) is None or self.arm.planner is None:
+            return
+        lo14, hi14 = [], []
+        for arm in ARM_ORDER:
+            lo, hi = self.arm_q_limits[arm]
+            a = self.joint_map[arm].rad_to_deg(lo)
+            b = self.joint_map[arm].rad_to_deg(hi)
+            lo14.append(np.minimum(a, b)); hi14.append(np.maximum(a, b))
+        lead = float(getattr(self.cfg.inex.servo_planner, "limit_lead_sec", 0.0))
+        self.arm.planner.set_position_limits(np.concatenate(lo14), np.concatenate(hi14), lead)
+        print(f"[Setup] 规划器位置限位已设（驱动度，前瞻 {lead*1000:.0f} ms）")
 
     def _apply_runtime_soft_limits(self) -> None:
         """用 /inex/get_soft_limits 的实测软限位覆盖配置表（查询失败则保留配置表）。"""
+        self._apply_ik_velocity_limits()
         r = self.cfg.robot
         margin = float(getattr(r, "soft_limit_margin_deg", 0.0))
         limits = {}
@@ -207,6 +223,19 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 limits[n] = (lo + margin, hi - margin)
         if limits:
             self._apply_driver_joint_limits(limits)
+
+    def _apply_ik_velocity_limits(self) -> None:
+        """ik.joint_velocity_limits_deg_s（7 轴，左右共用）覆盖 URDF 的 QP 关节速度上限；null 沿用 URDF。"""
+        lim = getattr(self.cfg.teleop.ik, "joint_velocity_limits_deg_s", None)
+        if not lim or not self.enable_joint_velocity_limits:
+            return
+        v = np.deg2rad(np.asarray(lim, dtype=float))
+        if v.size != 7:
+            print(f"[Placo] ⚠️ ik.joint_velocity_limits_deg_s 需 7 个值，得到 {v.size}，忽略")
+            return
+        for arm in ARM_ORDER:
+            self.set_arm_joint_velocity_limits(arm, v)
+        print(f"[Placo] QP 关节速度上限(°/s) = {list(map(float, lim))}")
 
     def _deg14_to_placo(self, arm_deg: np.ndarray) -> Dict[str, np.ndarray]:
         return {
@@ -265,6 +294,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
             publish_rate_hz=cfg.chassis.publish_rate_hz,
         )
         self.waist = F1WaistController(self.ros, ros_cfg.waist_cmd_topic)
+        # 调试：规划器之前的 IK 目标（度，14 轴），与 /inex/servo_cmd 对比可量化规划器引入的滞后
+        from sensor_msgs.msg import JointState
+        self._ik_target_pub = self.ros.node.create_publisher(JointState, "/f1_teleop/ik_target_deg", 10)
         self.lead_pub = LeadDataPublisher(
             self.ros,
             joint_state_topic=ros_cfg.lead_joint_state_topic,
@@ -306,6 +338,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.head.set_target(self.arm.get_part_deg("head", len(r.head_joint_names)))
 
         # 4. 双臂回零位（S 曲线），Placo / 规划器同步，夹爪初始化
+        self._check_feedback_inside_soft_limits()
         self.arm.move_to(self.home_pose_deg, r.home_duration_sec, r.move_rate_hz)
         self._sync_to_robot_pose(self.home_pose_deg)
         self._self_check(self.home_pose_deg)
@@ -330,6 +363,26 @@ class F1RokaeTeleopController(HardwareTeleopController):
             )
         else:
             print("[Setup] ⚠️ 安全门已禁用（无质心/碰撞保护）")
+
+    def _check_feedback_inside_soft_limits(self) -> None:
+        """反馈在驱动软限位外时任何 ServoJ/PTP 都会被拒并使整机掉电（2026-11-13 R-J4 141° 实例），回零前必须先用 jog 拉回。"""
+        fb = self.arm.get_arm_state_deg()
+        bad = []
+        for part, arm, sl in ((PART_LEFT_ARM, "left_arm", slice(0, 7)), (PART_RIGHT_ARM, "right_arm", slice(7, 14))):
+            soft = self.inex.get_soft_limits_deg(part)
+            if soft is None:
+                continue
+            for j, (q, (lo, hi)) in enumerate(zip(fb[sl], soft)):
+                if q < lo or q > hi:
+                    bad.append((part, arm, j, q, lo, hi))
+        if not bad:
+            return
+        lines = [f"  {arm} j{j+1} = {q:.1f}° 不在软限位 [{lo:.0f}, {hi:.0f}]，先用驱动 jog 拉回："
+                 f"ros2 service call /inex/start_jog inex_ros2_interface/srv/StartJog "
+                 f"'{{space: 0, part: {part}, axis: {j}, direction: {-1 if q > hi else 1}, speed_scale: 0.1}}'，"
+                 f"约 0.5 s 后 ros2 service call /inex/stop_jog inex_ros2_interface/srv/StopJog '{{}}'"
+                 for part, arm, j, q, lo, hi in bad]
+        raise RuntimeError("关节反馈在驱动软限位外，回零会被驱动拒绝并掉电，终止启动：\n" + "\n".join(lines))
 
     def _self_check(self, expected_deg: np.ndarray) -> None:
         fb = self.arm.get_arm_state_deg()
@@ -482,6 +535,15 @@ class F1RokaeTeleopController(HardwareTeleopController):
             self.prof_ctrl.note("clipped", int(np.any(clipped != delta)))
         return prev + clipped
 
+    def _publish_ik_target(self, arm_deg: np.ndarray) -> None:
+        if self._ik_target_pub.get_subscription_count() == 0:
+            return
+        from sensor_msgs.msg import JointState
+        msg = JointState()
+        msg.header.stamp = self.ros.now_msg()
+        msg.position = [float(v) for v in arm_deg]
+        self._ik_target_pub.publish(msg)
+
     def _send_command(self) -> None:
         if not self._resetting.is_set():
             if any(self.active.values()):
@@ -494,6 +556,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 if self.arm.planner is None:
                     arm_deg = self._limit_step(arm_deg)
                 self.arm.publish_planned_cmd(arm_deg, self.dt)
+                self._publish_ik_target(arm_deg)
                 self.prof_ctrl.note("pub", 1)
                 if self.arm.planner is not None and self.prof_ctrl.enabled:
                     self.prof_ctrl.note("planner_limited", self.arm.planner.limited_frames)

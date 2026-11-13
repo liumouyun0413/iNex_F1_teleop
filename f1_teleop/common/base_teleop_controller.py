@@ -218,6 +218,11 @@ class BaseTeleopController(abc.ABC):
                 values[self.placo_robot.model.names[joint_id]] = float(self.placo_robot.state.q[q_idx])
         return values
 
+    def set_arm_joint_velocity_limits(self, name: str, vmax_rad_s: np.ndarray) -> None:
+        """覆盖某臂的 QP 关节速度上限（弧度/秒；URDF <limit velocity> 往往与驱动实际限幅不一致）。"""
+        for jn, v in zip(self.manipulator_config[name]["joint_names"], np.asarray(vmax_rad_s, dtype=float)):
+            self.placo_robot.set_velocity_limit(jn, float(v))
+
     def set_arm_joint_limits(self, name: str, lower_rad: np.ndarray, upper_rad: np.ndarray) -> None:
         """覆盖某臂的关节位置限位（弧度）。qp 模式写入 Placo；clamp 模式只更新钳位表。"""
         lower = np.asarray(lower_rad, dtype=float)
