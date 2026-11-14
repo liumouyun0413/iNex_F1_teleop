@@ -276,6 +276,21 @@ class BaseTeleopController(abc.ABC):
             self.joints_regularization_task.set_joints(self._get_joint_values_dict())
         print("[Placo] 构型已同步，参考位姿已重置")
 
+    def rebase_arm_references(self) -> None:
+        """离合打滑：把末端任务与激活中手臂的手柄参考重新锚定到 Placo 当前构型，之后的手柄增量从此处起算。"""
+        with self._placo_lock:
+            self.placo_robot.update_kinematics()
+            for name, config in self.manipulator_config.items():
+                ee_xyz, ee_quat = self._get_link_pose(config["link_name"])
+                T = tf.quaternion_matrix(ee_quat)
+                T[:3, 3] = ee_xyz
+                self.effector_task[name].T_world_frame = T
+                if self.ref_ee_xyz[name] is not None:
+                    self.ref_ee_xyz[name], self.ref_ee_quat[name] = ee_xyz, ee_quat
+                self.ref_controller_xyz[name] = None
+                self.ref_controller_quat[name] = None
+                self._reset_slew(name)
+
     # ------------------------------------------------------------------ #
     # 输入处理
     # ------------------------------------------------------------------ #

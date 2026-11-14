@@ -613,12 +613,14 @@ class F1RokaeTeleopController(HardwareTeleopController):
     def _warn_step(self, ik_deg: np.ndarray) -> None:
         """WARN 期间：默认冻结，但允许“往回收”。
 
-        冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值。
+        冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值 + 手柄参考重新锚定到该构型（离合打滑）。
         放行判据用【末端方向】：本拍 IK 候选构型的每个末端，沿“质心越界方向”都不得比当前指令构型的末端更向外
         （等于：手柄往回收/横移放行，往越界方向推拒绝），并且驱动实测质心裕度比进入时恶化不超过 1 cm（闭环兑底）。
 
-        为什么不用模型质心做逐拍方向判据：2026-11-14 诊断显示手往回收时，IK 每一小步的模型质心 x 反而向外 0.04~0.34 mm
-        （末端后退时肘部抬起/前移，臂的质量重心局部前移），逐拍符号门 + 回写构成死锁：“回收瞬间动一下然后锁死”。
+        为什么被拒时必须重新锚定手柄参考：目标 = 锚定末端 + 手柄增量。臂冻结后手继续往前，目标跑到臂前方；手往回收只是
+        让目标靠近臂，IK 步仍然向外（2026-11-14 诊断：全部拒绝、步长 -1~-7 mm），要回收到越过冻结点臂才动——操作者感觉“锁死”。
+        逐拍重锚后，手柄下一拍的增量直接决定方向：回收即跟随，前推被吃掉。
+        为什么不用模型质心做逐拍方向判据：手往回收时 IK 每一小步的模型质心 x 反而向外 0.04~0.34 mm（肘部抬起/前移）。
         历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target → 自锁匀速漂走），必须用 hold()。"""
         prev = self.arm.last_cmd_deg
         if prev is None:
@@ -666,17 +668,11 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.arm.publish_hold_cmd(self.dt)
         if self.arm.last_cmd_deg is not None:
             self._revert_placo_arms(self.arm.last_cmd_deg)
+            self.rebase_arm_references()
             self._publish_ik_target(self.arm.last_cmd_deg)
 
-    def _placo_com_xy(self) -> np.ndarray:
-        with self._placo_lock:
-            # solver.solve(True) 只写 q，不刷新运动学；不先 update_kinematics 读到的是上一次刷新（即回写构型）的质心，
-            # 候选目标与基准永远相等 → 回收永远不放行（2026-11-14 实测死锁原因）
-            self.placo_robot.update_kinematics()
-            return np.asarray(self.placo_robot.com_world())[:2].copy()
-
     def _revert_placo_arms(self, arm_deg: np.ndarray) -> None:
-        """把 Placo 双臂 q 回写为给定驱动角（不重置手柄参考，保持相对控制连续）。"""
+        """把 Placo 双臂 q 回写为给定驱动角。"""
         q = self._deg14_to_placo(arm_deg)
         with self._placo_lock:
             for name, qi in q.items():
