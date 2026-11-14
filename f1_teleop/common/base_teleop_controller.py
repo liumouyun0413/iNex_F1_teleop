@@ -116,6 +116,9 @@ class BaseTeleopController(abc.ABC):
         # 上一帧实际下发给 IK 的增量（摆率限制状态）
         self._slew_xyz: Dict[str, np.ndarray] = {n: np.zeros(3) for n in names}
         self._slew_rot: Dict[str, np.ndarray] = {n: np.zeros(3) for n in names}
+        # 本帧手柄位移（世界系、已乘 scale，不受重锚影响）：安全门用来判断操作者是在推还是在收
+        self.controller_step_xyz: Dict[str, np.ndarray] = {n: np.zeros(3) for n in names}
+        self._last_controller_xyz: Dict[str, Optional[np.ndarray]] = {n: None for n in names}
 
         self.gripper_pos_target: Dict[str, float] = {}
         for name, config in manipulator_config.items():
@@ -316,6 +319,10 @@ class BaseTeleopController(abc.ABC):
             tf.quaternion_multiply(R_quat, controller_quat), tf.quaternion_conjugate(R_quat)
         )
 
+        last = self._last_controller_xyz[name]
+        self.controller_step_xyz[name] = np.zeros(3) if last is None else (controller_xyz - last) * self.scale_factor
+        self._last_controller_xyz[name] = controller_xyz
+
         if self.ref_controller_xyz[name] is None:
             self.ref_controller_xyz[name] = controller_xyz
             self.ref_controller_quat[name] = controller_quat
@@ -457,6 +464,8 @@ class BaseTeleopController(abc.ABC):
                         self.ref_controller_xyz[name] = None
                         self.ref_controller_quat[name] = None
                         self._reset_slew(name)
+                        self._last_controller_xyz[name] = None
+                        self.controller_step_xyz[name] = np.zeros(3)
                         # 末端任务回到当前位姿，松开后不再漂移
                         ee_xyz, ee_quat = self._get_link_pose(config["link_name"])
                         T = tf.quaternion_matrix(ee_quat)

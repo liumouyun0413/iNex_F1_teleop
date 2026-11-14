@@ -84,6 +84,8 @@ def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
 
 
 class F1RokaeTeleopController(HardwareTeleopController):
+    WARN_HAND_EPS_M = 3e-4   # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
+
     def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
         self.cfg = cfg
         r, t = cfg.robot, cfg.teleop
@@ -146,7 +148,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
-        self._warn_ref: Optional[Tuple[Dict[str, np.ndarray], float]] = None   # WARN：(指令构型两末端 xy, 进入时驱动裕度)
+        self._warn_ref: Optional[float] = None   # WARN：进入时的驱动质心裕度（m）
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -614,13 +616,15 @@ class F1RokaeTeleopController(HardwareTeleopController):
         """WARN 期间：默认冻结，但允许“往回收”。
 
         冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值 + 手柄参考重新锚定到该构型（离合打滑）。
-        放行判据用【末端方向】：本拍 IK 候选构型的每个末端，沿“质心越界方向”都不得比当前指令构型的末端更向外
-        （等于：手柄往回收/横移放行，往越界方向推拒绝），并且驱动实测质心裕度比进入时恶化不超过 1 cm（闭环兑底）。
+        放行判据用【操作者手柄本帧位移】沿越界方向的分量（激活臂中取最小，向内为正）：
+          向内 (> +ε)   → 放行（不论裕度，否则裕度恶化后无法回收→死锁）
+          中性 (|·| ≤ ε) → 横移/静止/慢推：放行，但驱动实测裕度比进入时恶化 >1 cm 即拒绝（慢推累积的闭环兑底）
+          向外 (< -ε)   → 拒绝：刹停 + 回写 + 重锚，前推量被吃掉
+        不用 IK 候选末端/模型质心做逐拍方向：另一臂的 IK 抖动 ±0.2 mm 和肘部抬起都会被误判为“向外”，重锚后目标误差归零、
+        IK 一阶响应被反复打断，回收变成远低于手速的蠕动（2026-11-14 诊断：放行 68/拒绝 17，步长 -0.2~+0.4 mm，臂几乎不动）。
 
         为什么被拒时必须重新锚定手柄参考：目标 = 锚定末端 + 手柄增量。臂冻结后手继续往前，目标跑到臂前方；手往回收只是
-        让目标靠近臂，IK 步仍然向外（2026-11-14 诊断：全部拒绝、步长 -1~-7 mm），要回收到越过冻结点臂才动——操作者感觉“锁死”。
-        逐拍重锚后，手柄下一拍的增量直接决定方向：回收即跟随，前推被吃掉。
-        为什么不用模型质心做逐拍方向判据：手往回收时 IK 每一小步的模型质心 x 反而向外 0.04~0.34 mm（肘部抬起/前移）。
+        让目标靠近臂，IK 步仍然向外，要回收到越过冻结点臂才动——操作者感觉“锁死”。
         历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target → 自锁匀速漂走），必须用 hold()。"""
         prev = self.arm.last_cmd_deg
         if prev is None:
@@ -631,27 +635,19 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if self._warn_ref is None or not np.any(d):
             self._hold_and_revert()
             if np.any(d):
-                self._warn_ref = (self._placo_ee_xy(), mw)
+                self._warn_ref = mw
             return
-        ee_ref, entry_margin = self._warn_ref
-        ee_cand = self._placo_ee_xy()                      # Placo 当前 = 本拍 IK 候选目标
-        steps = {n: float(np.dot(ee_cand[n] - ee_ref[n], d)) for n in ARM_ORDER}   # 向内为正
-        accept = all(v > -1e-4 for v in steps.values()) and mw >= entry_margin - 0.01
-        self._warn_dbg_update(accept, min(steps.values()), mw - entry_margin)
+        entry_margin = self._warn_ref
+        steps = [float(np.dot(self.controller_step_xyz[n][:2], d)) for n in ARM_ORDER if self.active[n]]
+        hand = min(steps) if steps else 0.0
+        eps = self.WARN_HAND_EPS_M
+        accept = hand > eps or (hand >= -eps and mw >= entry_margin - 0.01)
+        self._warn_dbg_update(accept, hand, mw - entry_margin)
         if accept:
             self.arm.publish_planned_cmd(ik_deg, self.dt)
             self._publish_ik_target(ik_deg)
-            self._warn_ref = (ee_cand, entry_margin)
             return
         self._hold_and_revert()
-        self._warn_ref = (self._placo_ee_xy(), entry_margin)   # 基准回到实际指令构型的末端
-
-    def _placo_ee_xy(self) -> Dict[str, np.ndarray]:
-        """当前 Placo 构型下两末端的 xy（先刷新运动学：solver.solve(True) 只写 q）。"""
-        with self._placo_lock:
-            self.placo_robot.update_kinematics()
-            return {n: self.placo_robot.get_T_world_frame(self.manipulator_config[n]["link_name"])[:2, 3].copy()
-                    for n in ARM_ORDER}
 
     def _warn_dbg_update(self, accept: bool, dproj: float, dmargin: float) -> None:
         """WARN 放行/拒绝的 1 Hz 诊断统计。"""
@@ -660,7 +656,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         st["dp_min"] = min(st["dp_min"], dproj); st["dp_max"] = max(st["dp_max"], dproj)
         now = time.monotonic()
         if now - st["t"] >= 1.0:
-            print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 末端相对指令沿越界方向的最小步(向内为正) "
+            print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 手柄沿越界方向的每帧位移(向内为正) "
                   f"{st['dp_min']*1000:+.2f}~{st['dp_max']*1000:+.2f} mm | 驱动裕度变化 {dmargin*100:+.1f} cm")
             st.update(t=now, acc=0, rej=0, dp_min=1e9, dp_max=-1e9)
 
