@@ -607,17 +607,19 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._com_state = new
         return new
 
-    def _warn_target(self, ik_deg: np.ndarray) -> np.ndarray:
-        """WARN 期间：硬冻结。下发值固定为上次指令，并每拍把 Placo 双臂构型回写为该指令，
-        使 IK 状态不会跟着手柄跑远。解除只有两条路：X+Y 复位，或质心自行回到 warn 盒内（解除时重新锚定）。
+    def _warn_hold(self) -> None:
+        """WARN 期间：硬冻结。规划器进入 hold（按 amax 刹停到进入时的指令位置快照），并每拍把 Placo 双臂构型
+        回写为实际下发值，使 IK 状态不会跟着手柄跑远。解除只有两条路：X+Y 复位，或质心自行回到 warn 盒内（解除时重新锚定）。
 
-        2026-11-14 两次实测否定了“只接受模型质心向内的目标”的软冻结：URDF 模型与驱动质心在毫米级上方向可以相反
-        （双臂前上抬时模型 x 减小、驱动 x 增大），导致手柄不动时双臂仍以 ~5 cm/s 朝旧目标缓慢前伸。"""
-        prev = self.arm.last_cmd_deg
-        if prev is None:
-            return ik_deg
-        self._revert_placo_arms(prev)
-        return prev.copy()
+        2026-11-14 三次实测的教训：
+        * “只接受模型质心向内的目标”不可靠——URDF 模型与驱动质心在毫米级上方向可以相反；
+        * 把“上一帧规划器输出”当目标再喂回规划器也不行——clamp 模式在 err=0 时输出 v=v_target，而 v_target 由目标增量
+          估计，目标就是自己的输出时形成 v→v_target→v 自锁，双臂以进入 WARN 时的速度持续匀速漂走（实测 ~7°/s）。
+          因此必须用 planner.hold()：目标是固定快照、目标速度强制为 0。"""
+        self.arm.publish_hold_cmd(self.dt)
+        if self.arm.last_cmd_deg is not None:
+            self._revert_placo_arms(self.arm.last_cmd_deg)
+            self._publish_ik_target(self.arm.last_cmd_deg)
 
     def _revert_placo_arms(self, arm_deg: np.ndarray) -> None:
         """把 Placo 双臂 q 回写为给定驱动角（不重置手柄参考，保持相对控制连续）。"""
@@ -632,12 +634,11 @@ class F1RokaeTeleopController(HardwareTeleopController):
             com = self._update_com_guard()
             if any(self.active.values()):
                 self._streaming = True
-            if self._streaming and com != "STOP":
+            if self._streaming and com == "WARN":
+                self._warn_hold()
+            elif self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
-                # 质心 WARN：硬冻结在上次下发值（见 _warn_target）
                 arm_deg = self._placo_to_deg14()
-                if com == "WARN":
-                    arm_deg = self._warn_target(arm_deg)
                 if self.safety:
                     arm_deg = self.safety.filter(arm_deg)
                 if self.arm.planner is None:

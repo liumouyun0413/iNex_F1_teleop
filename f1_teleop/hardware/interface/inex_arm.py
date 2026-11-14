@@ -112,6 +112,7 @@ class ServoJPlanner:
         self.limit_lead = 0.0
         self.limit_buffer = 0.0
         self.limit_clip_frames = np.zeros(n, dtype=int)   # 逐轴：被限位前瞻夾速的帧数（诊断）
+        self._hold_pos: Optional[np.ndarray] = None       # hold() 的刹停目标快照
 
     @property
     def anchored(self) -> bool:
@@ -146,8 +147,26 @@ class ServoJPlanner:
         self._prev_target = None
         self._v_target = np.zeros(self.n)
 
+    def hold(self, dt: float) -> np.ndarray:
+        """刹停并保持：目标 = 首次调用时的输出位置快照，目标速度强制为 0，按 amax 减速并回到快照点。
+
+        ★ 不要用 step(上一帧输出) 来“冻结”：clamp 模式在 err=0 时输出 v = v_target，而 v_target 是由目标增量估的，
+        目标就是自己的输出时形成 v → v_target → v 的自锁，会以进入时的速度持续匀速漂走
+        （2026-11-14 质心 WARN “手柄不动双臂自行前伸”的根因）。"""
+        if self.pos is None:
+            return np.zeros(self.n)
+        if self._hold_pos is None:
+            self._hold_pos = self.pos.copy()
+        self._v_target[:] = 0.0
+        self._prev_target = self._hold_pos.copy()
+        out = self.step(self._hold_pos, dt)
+        self._v_target[:] = 0.0            # step() 会用 target-prev_target(=0) 更新 EMA，这里确保为 0
+        return out
+
     def step(self, target_deg: Sequence[float], dt: float) -> np.ndarray:
         target = np.asarray(target_deg, dtype=float)
+        if self._hold_pos is not None and not np.array_equal(target, self._hold_pos):
+            self._hold_pos = None          # 正常跟随恢复
         if self.pos is None:
             self.anchor(target)
             self._prev_target = target.copy()
@@ -308,6 +327,12 @@ class InexArmController:
         if self.planner is None:
             return self.publish_arm_cmd(target_deg)
         return self.publish_arm_cmd(self.planner.step(target_deg, dt))
+
+    def publish_hold_cmd(self, dt: float) -> bool:
+        """刹停并保持在当前指令位置（见 ServoJPlanner.hold）；无 planner 时重发上一帧。"""
+        if self.planner is None or not self.planner.anchored:
+            return self.publish_arm_cmd(self.last_cmd_deg) if self.last_cmd_deg is not None else False
+        return self.publish_arm_cmd(self.planner.hold(dt))
 
     def anchor_planner(self, pos_deg: Optional[Sequence[float]] = None) -> None:
         """把规划器锚定到给定位置（默认真机反馈），速度清零。"""
