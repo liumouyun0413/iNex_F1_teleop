@@ -146,7 +146,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
-        self._warn_ref: Optional[Tuple[float, float]] = None   # WARN 进入时：(指令构型模型质心向内投影, 驱动裕度)
+        self._warn_ref: Optional[Tuple[Dict[str, np.ndarray], float]] = None   # WARN：(指令构型两末端 xy, 进入时驱动裕度)
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -613,14 +613,13 @@ class F1RokaeTeleopController(HardwareTeleopController):
     def _warn_step(self, ik_deg: np.ndarray) -> None:
         """WARN 期间：默认冻结，但允许“往回收”。
 
-        冻结 = planner.hold()（刹停到进入时的指令快照）+ 把 Placo 双臂回写为实际下发值。
-        每拍把 IK 候选目标与【当前指令构型】比较（基准随指令更新，而不是固定在进入时刻——否则每拍回写后
-        IK 只能前进一小步，永远跨不过任何死区，实测表现为“手柄往回收双臂也不动”）。放行条件：
-          1. 候选目标的模型质心（URDF 惯性参数）沿“向盒内方向”比当前指令构型更靠内（纯方向判据，不设死区）；
-          2. 驱动实测质心到 warn 盒的裕度没有比进入时恶化超过 1 cm（闭环复核：模型方向判断错了最多再走 1 cm 就重新冻结）。
-        放行后指令只会单调向内（模型意义上），向外的一步立即被拒并撤销。
-        历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target，v_target 由目标增量
-        估计 → 自锁匀速漂走），必须用 hold()。"""
+        冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值。
+        放行判据用【末端方向】：本拍 IK 候选构型的每个末端，沿“质心越界方向”都不得比当前指令构型的末端更向外
+        （等于：手柄往回收/横移放行，往越界方向推拒绝），并且驱动实测质心裕度比进入时恶化不超过 1 cm（闭环兑底）。
+
+        为什么不用模型质心做逐拍方向判据：2026-11-14 诊断显示手往回收时，IK 每一小步的模型质心 x 反而向外 0.04~0.34 mm
+        （末端后退时肘部抬起/前移，臂的质量重心局部前移），逐拍符号门 + 回写构成死锁：“回收瞬间动一下然后锁死”。
+        历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target → 自锁匀速漂走），必须用 hold()。"""
         prev = self.arm.last_cmd_deg
         if prev is None:
             self.arm.publish_hold_cmd(self.dt)
@@ -630,18 +629,38 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if self._warn_ref is None or not np.any(d):
             self._hold_and_revert()
             if np.any(d):
-                self._warn_ref = (float(np.dot(self._placo_com_xy(), d)), mw)
+                self._warn_ref = (self._placo_ee_xy(), mw)
             return
-        ref_proj, entry_margin = self._warn_ref
-        proj = float(np.dot(self._placo_com_xy(), d))     # Placo 当前 = 本拍 IK 候选目标
-        if proj > ref_proj + 1e-5 and mw >= entry_margin - 0.01:
+        ee_ref, entry_margin = self._warn_ref
+        ee_cand = self._placo_ee_xy()                      # Placo 当前 = 本拍 IK 候选目标
+        steps = {n: float(np.dot(ee_cand[n] - ee_ref[n], d)) for n in ARM_ORDER}   # 向内为正
+        accept = all(v > -1e-4 for v in steps.values()) and mw >= entry_margin - 0.01
+        self._warn_dbg_update(accept, min(steps.values()), mw - entry_margin)
+        if accept:
             self.arm.publish_planned_cmd(ik_deg, self.dt)
             self._publish_ik_target(ik_deg)
-            self._warn_ref = (proj, entry_margin)
+            self._warn_ref = (ee_cand, entry_margin)
             return
         self._hold_and_revert()
-        # 基准回到实际指令构型，下一拍只要比它更靠内就放行
-        self._warn_ref = (float(np.dot(self._placo_com_xy(), d)), entry_margin)
+        self._warn_ref = (self._placo_ee_xy(), entry_margin)   # 基准回到实际指令构型的末端
+
+    def _placo_ee_xy(self) -> Dict[str, np.ndarray]:
+        """当前 Placo 构型下两末端的 xy（先刷新运动学：solver.solve(True) 只写 q）。"""
+        with self._placo_lock:
+            self.placo_robot.update_kinematics()
+            return {n: self.placo_robot.get_T_world_frame(self.manipulator_config[n]["link_name"])[:2, 3].copy()
+                    for n in ARM_ORDER}
+
+    def _warn_dbg_update(self, accept: bool, dproj: float, dmargin: float) -> None:
+        """WARN 放行/拒绝的 1 Hz 诊断统计。"""
+        st = self.__dict__.setdefault("_warn_dbg", {"t": time.monotonic(), "acc": 0, "rej": 0, "dp_min": 1e9, "dp_max": -1e9})
+        st["acc" if accept else "rej"] += 1
+        st["dp_min"] = min(st["dp_min"], dproj); st["dp_max"] = max(st["dp_max"], dproj)
+        now = time.monotonic()
+        if now - st["t"] >= 1.0:
+            print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 末端相对指令沿越界方向的最小步(向内为正) "
+                  f"{st['dp_min']*1000:+.2f}~{st['dp_max']*1000:+.2f} mm | 驱动裕度变化 {dmargin*100:+.1f} cm")
+            st.update(t=now, acc=0, rej=0, dp_min=1e9, dp_max=-1e9)
 
     def _hold_and_revert(self) -> None:
         self.arm.publish_hold_cmd(self.dt)
