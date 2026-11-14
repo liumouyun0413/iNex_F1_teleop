@@ -85,7 +85,6 @@ def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
 
 class F1RokaeTeleopController(HardwareTeleopController):
     WARN_HAND_EPS_M = 3e-4        # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
-    WARN_LOCK_MARGIN_M = 0.01     # WARN 中允许预测质心越出 warn 盒的深度；需 < stop 盒与 warn 盒的间距（3 cm）
 
     def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
         self.cfg = cfg
@@ -150,6 +149,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._com_state = "OK"
         self._com_last_print = 0.0
         self._warn_ref: Optional[np.ndarray] = None   # WARN：驱动质心 - 模型质心 的 xy 偏置（m），冻结时标定
+        self._warn_lock_m = 0.002                     # WARN 中允许预测质心越出 warn 盒的深度（配置 com_guard.lock_margin_m）
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -368,6 +368,11 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 self.ros, cg.topic, cg.stop_min, cg.stop_max, cg.warn_min, cg.warn_max,
                 timeout_ms=cg.timeout_ms, hysteresis_m=cg.hysteresis_m, hold_warn_sec=cg.hold_warn_sec,
             )
+            self._warn_lock_m = float(getattr(cg, "lock_margin_m", self._warn_lock_m))
+            gap = float(np.min(np.minimum(self.com_guard.warn_min - self.com_guard.stop_min,
+                                          self.com_guard.stop_max - self.com_guard.warn_max)[:2]))
+            if not 0.0 <= self._warn_lock_m < gap:
+                raise RuntimeError(f"[CoM] com_guard.lock_margin_m={self._warn_lock_m} 必须在 [0, warn→stop 间距 {gap:.3f}) 内")
             if self.com_guard.wait_for_data(5.0):
                 p = self.com_guard.position; mw, ms = self.com_guard.margin()
                 print(f"[CoM] 质心保护已启用：当前 {np.round(p, 3)} m (M={self.com_guard.mass:.1f} kg) | 距 warn/stop 盒 {mw*100:.1f}/{ms*100:.1f} cm")
@@ -618,7 +623,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
 
         冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值 + 手柄参考重新锚定到该构型（离合打滑）。
         放行判据：本拍 IK 候选构型的模型质心 + 偏置（驱动实测 - 模型，在指令构型上标定，每次冻结时刷新）落在
-        锁定盒（warn 盒向外扩 WARN_LOCK_MARGIN_M）内 → 正常遥操（回收/横移/小幅前推都连续跟随）；
+        锁定盒（warn 盒向外扩 com_guard.lock_margin_m）内 → 正常遥操（回收/横移/小幅前推都连续跟随）；
         越出 → 拒绝：刹停 + 回写 + 重锚，前推量被吃掉。锁定盒到 stop 盒之间是模型误差/滞后的余量，stop 盒是硬底线。
         逃生口：指令构型本身已在锁定盒外（偏置刷新/动态超调）时，所有候选都在盒外会死锁，此时操作者明确回收（所有激活手柄不向外、
         至少一只明显向内）也放行。
@@ -641,7 +646,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         steps = [float(np.dot(self.controller_step_xyz[n][:2], d)) for n in ARM_ORDER if self.active[n]]
         eps = self.WARN_HAND_EPS_M
         retracting = bool(steps) and np.any(d) and min(steps) >= -eps and max(steps) > 3 * eps
-        accept = m_pred >= -self.WARN_LOCK_MARGIN_M or retracting
+        accept = m_pred >= -self._warn_lock_m or retracting
         self._warn_dbg_update(accept, m_pred, self.com_guard.margin()[0])
         if accept:
             self.arm.publish_planned_cmd(ik_deg, self.dt)
@@ -668,7 +673,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         now = time.monotonic()
         if now - st["t"] >= 1.0:
             print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 候选构型预测质心距 warn 盒 "
-                  f"{st['dp_min']*100:+.1f}~{st['dp_max']*100:+.1f} cm (锁定线 {-self.WARN_LOCK_MARGIN_M*100:+.1f}) | 驱动实测 {m_drv*100:+.1f} cm")
+                  f"{st['dp_min']*100:+.1f}~{st['dp_max']*100:+.1f} cm (锁定线 {-self._warn_lock_m*100:+.1f}) | 驱动实测 {m_drv*100:+.1f} cm")
             st.update(t=now, acc=0, rej=0, dp_min=1e9, dp_max=-1e9)
 
     def _hold_and_revert(self) -> None:

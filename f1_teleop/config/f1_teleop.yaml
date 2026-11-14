@@ -224,6 +224,9 @@ com_guard:
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
+  # WARN 中的“墙”：目标构型的预测质心（模型 + 冻结时标定的驱动偏置）最多越出 warn 盒这么深，再外就拒绝并重锚。
+  # 质心位移 ≈ 手位移 × 臂质量占比(≈4%)：1 cm ≈ 手走 25 cm（实测“放行太多”），2 mm ≈ 5 cm。必须 < stop-warn 间距。
+  lock_margin_m: 0.002
 
 # ----------------------------------------------------------------------------
 safety:
