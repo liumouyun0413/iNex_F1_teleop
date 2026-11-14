@@ -651,6 +651,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
 
     def _placo_com_xy(self) -> np.ndarray:
         with self._placo_lock:
+            # solver.solve(True) 只写 q，不刷新运动学；不先 update_kinematics 读到的是上一次刷新（即回写构型）的质心，
+            # 候选目标与基准永远相等 → 回收永远不放行（2026-11-14 实测死锁原因）
+            self.placo_robot.update_kinematics()
             return np.asarray(self.placo_robot.com_world())[:2].copy()
 
     def _revert_placo_arms(self, arm_deg: np.ndarray) -> None:
