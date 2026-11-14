@@ -43,6 +43,7 @@ class ComGuard:
         timeout_ms: float = 200.0,
         hysteresis_m: float = 0.01,
         hold_warn_sec: float = 0.3,
+        stop_confirm_frames: int = 3,
     ) -> None:
         self.stop_min = np.asarray(stop_min, dtype=float)
         self.stop_max = np.asarray(stop_max, dtype=float)
@@ -53,6 +54,9 @@ class ComGuard:
         self.timeout = float(timeout_ms) / 1000.0
         self.hyst = float(hysteresis_m)
         self.hold_warn = float(hold_warn_sec)
+        self.stop_confirm = max(1, int(stop_confirm_frames))   # 连续多少次 evaluate 越出 stop 盒才闩锁（滤单帧野值）
+        self._stop_viol = 0
+        self.last_stop_reason = ""
 
         self._lock = threading.Lock()
         self._pos: Optional[np.ndarray] = None
@@ -146,19 +150,27 @@ class ComGuard:
         now = time.monotonic()
         with self._lock:
             p = self._pos
-            stale = self._armed and (p is None or now - self._t_last_valid > self.timeout)
+            n_msgs = self._n_msgs
+            age = now - self._t_last_valid
+            stale = self._armed and (p is None or age > self.timeout)
         if self._latched_stop:
             return STATE_STOP
         if stale:
+            self.last_stop_reason = f"/inex/com_state 超时：{'未收到有效帧' if p is None else f'{age*1000:.0f} ms 无有效帧'}（累计收到 {n_msgs} 帧）"
             self._latched_stop = True
             self._state = STATE_STOP
             return STATE_STOP
         if p is None:
             return self._state
         if not self._inside(p, self.stop_min, self.stop_max, 0.0):
-            self._latched_stop = True
-            self._state = STATE_STOP
-            return STATE_STOP
+            self._stop_viol += 1
+            if self._stop_viol >= self.stop_confirm:
+                self.last_stop_reason = f"质心越出 stop 盒：p={np.round(p, 3)} 连续 {self._stop_viol} 拍"
+                self._latched_stop = True
+                self._state = STATE_STOP
+                return STATE_STOP
+        else:
+            self._stop_viol = 0
         if self._state == STATE_WARN:
             # 退出 warn 需回到内缩 hyst 的区域且停留 hold_warn 秒
             if self._inside(p, self.warn_min, self.warn_max, self.hyst):

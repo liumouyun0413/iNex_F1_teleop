@@ -148,6 +148,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
+        self._xr_last_ts = -1
+        self._xr_last_change = time.monotonic()
+        self._xr_frozen = False
         self._warn_ref: Optional[np.ndarray] = None   # WARN：驱动质心 - 模型质心 的 xy 偏置（m），冻结时标定
         self._warn_lock_m = 0.002                     # WARN 中允许预测质心越出 warn 盒的深度（配置 com_guard.lock_margin_m）
 
@@ -473,11 +476,26 @@ class F1RokaeTeleopController(HardwareTeleopController):
         return not self._head_active
 
     def _pre_ik_update(self) -> None:
+        self._xr_watchdog()
         if self._resetting.is_set():
             return
         self._handle_buttons()
         self._update_head()
         self._update_chassis()
+
+    def _xr_watchdog(self) -> None:
+        """PICO 数据流断流时按键/扳机/位姿全部冻结（X+Y 和重新握把都无响应），把它显式打出来。"""
+        ts = self.xr_client.get_timestamp_ns()
+        now = time.monotonic()
+        if ts != self._xr_last_ts:
+            self._xr_last_ts = ts
+            if self._xr_frozen:
+                print(f"[XR] ✅ 手柄数据流恢复（中断 {now - self._xr_last_change:.1f} s）")
+                self._xr_frozen = False
+            self._xr_last_change = now
+        elif not self._xr_frozen and now - self._xr_last_change > 0.5:
+            self._xr_frozen = True
+            print("[XR] ⚠️ 手柄数据流已 0.5 s 未更新（PICO 断流/应用后台？）：此期间 X+Y、扳机、摇杆均无效")
 
     # ------------------------------------------------------------------ #
     # 按键：复位 / 腰
@@ -617,6 +635,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                      "（已平滑制动，X+Y 复位后解除）" if new == "STOP" else ""))
             self._com_last_print = now
         if new == "STOP" and self._com_state != "STOP":
+            print(f"[CoM] 停机原因：{self.com_guard.last_stop_reason}")
             self._streaming = False
             self.inex.halt()
         if self._com_state == "WARN" and new == "OK" and self.arm.last_cmd_deg is not None:
