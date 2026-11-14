@@ -24,6 +24,7 @@ try:
     from inex_ros2_interface.msg import RobotSystemStatus
     from inex_ros2_interface.srv import (
         GetCollisionConfig,
+        GetPayload,
         GetSoftLimits,
         Halt,
         HotReset,
@@ -35,6 +36,7 @@ try:
         SetJointStiffness,
         SetMotionProfile,
         SetMotionServoMode,
+        SetPayload,
         SetRobotMode,
         StartImpedance,
         StopImpedanceSession,
@@ -100,6 +102,8 @@ class InexClient:
         self._set_stiffness = node.create_client(SetJointStiffness, "/inex/set_joint_stiffness")
         self._start_impedance = node.create_client(StartImpedance, "/inex/start_impedance")
         self._stop_impedance = node.create_client(StopImpedanceSession, "/inex/stop_impedance_session")
+        self._get_payload = node.create_client(GetPayload, "/inex/get_payload")
+        self._set_payload = node.create_client(SetPayload, "/inex/set_payload")
         self.impedance_parts: Tuple[int, ...] = ()   # 已开启阻抗会话的分区（退出时 stop_impedance_session）
 
         self._powered_mask: Optional[int] = None
@@ -184,8 +188,9 @@ class InexClient:
     # ------------------------------------------------------------------ #
     def prepare_arms(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM),
                      impedance_parts: Tuple[int, ...] = (),
-                     joint_stiffness: Optional[Sequence[float]] = None) -> bool:
-        """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → 运动档 → ServoJ。返回双臂是否确认上电。
+                     joint_stiffness: Optional[Sequence[float]] = None,
+                     payload_cfg=None) -> bool:
+        """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → 负载 → 运动档 → ServoJ。返回双臂是否确认上电。
 
         impedance_parts 中的分区走关节阻抗档：READY 下热切 JOINT_IMPEDANCE → （可选）设关节刚度 → start_impedance（HOLD）→ ServoJ。
         2026-11-14 ms-thor 实测：阻抗 HOLD（activity=3）下 set_motion_servo_mode(ServoJ) 返回 0。不标定力矩传感器。"""
@@ -196,6 +201,7 @@ class InexClient:
         self.recover_from_error()
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
+        self.apply_payloads(payload_cfg)
         # 先把所有分区的运动档设好，再开阻抗会话：set_motion_profile 会重新 apply 控制模式，
         # 在另一臂会话已开启时调用会把那只臂打回位置控制（2026-11-14 左臂先 start、再设右臂档 → 左臂不再柔顺）
         for part in parts:
@@ -289,6 +295,40 @@ class InexClient:
             res = self._call(self._stop_impedance, req, "stop_impedance_session", timeout=10.0)
             print(f"[iNex] {PART_NAME.get(part, part)} stop_impedance_session code={self._code(res)}")
         self.impedance_parts = ()
+
+    # ------------------------------------------------------------------ #
+    # 负载（影响 /inex/com_state 整机质心与阻抗重力补偿）
+    # ------------------------------------------------------------------ #
+    def get_payload(self, part: int):
+        req = GetPayload.Request(); req.part = part
+        res = self._call(self._get_payload, req, "get_payload", timeout=2.0)
+        return res if (res is not None and res.code == 0) else None
+
+    def set_payload(self, part: int, mass: float, com: Sequence[float],
+                    inertia: Optional[Sequence[float]] = None) -> bool:
+        req = SetPayload.Request()
+        req.part = part; req.mass = float(mass)
+        req.com = [float(v) for v in com]
+        req.inertia = [float(v) for v in (inertia if inertia is not None else (0.0,) * 6)]
+        if len(req.com) != 3 or len(req.inertia) != 6:
+            raise ValueError(f"payload com 需 3 个值、inertia 需 6 个值（{PART_NAME.get(part, part)}）")
+        res = self._call(self._set_payload, req, "set_payload", timeout=5.0)
+        ok = res is not None and res.code == 0
+        print(f"[iNex] {PART_NAME.get(part, part)} set_payload mass={req.mass} com={list(req.com)} {'✅' if ok else '❌ code=' + self._code(res)}")
+        return ok
+
+    def apply_payloads(self, payload_cfg) -> None:
+        """按配置（inex.payload.left/right：mass, com[3], inertia[6]；null=不改）设置负载，并打印驱动当前值。"""
+        for side, part in (("left", PART_LEFT_ARM), ("right", PART_RIGHT_ARM)):
+            spec = getattr(payload_cfg, side, None) if payload_cfg is not None else None
+            if spec is not None:
+                self.set_payload(part, spec.mass, spec.com, getattr(spec, "inertia", None))
+            cur = self.get_payload(part)
+            if cur is None:
+                print(f"[iNex] {PART_NAME[part]} 负载查询失败")
+            else:
+                print(f"[iNex] {PART_NAME[part]} 负载: configured={cur.configured} mass={cur.mass:.3f} kg "
+                      f"com={[round(float(v), 4) for v in cur.com]} m" + ("" if spec is not None else "（沿用驱动当前值）"))
 
     def print_collision_config(self, parts) -> None:
         for part in parts:

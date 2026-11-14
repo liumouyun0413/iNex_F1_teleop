@@ -107,6 +107,12 @@ inex:
   gripper_state_hz: 30                # /inex/set_gripper_publish_frequency
   gripper_force_speed: null           # [force 20~100, speed 1~100]；null=沿用驱动默认
   halt_on_exit: true                  # 退出时 /inex/halt(part=0xFF) 平滑制动（不下电）
+  # 末端负载（/inex/set_payload，法兰系）：驱动用它算 /inex/com_state 整机质心（质心保护的输入）和阻抗重力补偿。
+  # 2026-11-14 ms-thor 驱动默认：双臂 mass 2.2 kg, com [0.005, 0, 0.07] m, inertia 0（即夹爪）。换夹具/抓重物时改这里；
+  # null = 沿用驱动当前值（启动时仍会打印）。
+  payload:
+    left:  null                       # 例：{mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}
+    right: null
   # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
   # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
   impedance:
