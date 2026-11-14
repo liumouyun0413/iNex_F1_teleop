@@ -196,14 +196,16 @@ class InexClient:
         self.recover_from_error()
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
+        # 先把所有分区的运动档设好，再开阻抗会话：set_motion_profile 会重新 apply 控制模式，
+        # 在另一臂会话已开启时调用会把那只臂打回位置控制（2026-11-14 左臂先 start、再设右臂档 → 左臂不再柔顺）
+        for part in parts:
+            self.set_profile(part, PROFILE_JOINT_IMPEDANCE if part in impedance_parts else PROFILE_JOINT_POSITION)
         for part in parts:
             if part in impedance_parts:
-                self.set_profile(part, PROFILE_JOINT_IMPEDANCE)
                 if joint_stiffness is not None:
                     self.set_joint_stiffness(part, joint_stiffness)
-                self.start_impedance(part)
-            else:
-                self.set_profile(part, PROFILE_JOINT_POSITION)
+                self.start_impedance(part)          # 文档：part 禁止 255，双臂顺序两次
+        for part in parts:
             self.set_servo_mode(part, SERVO_MODE_J)
         self.print_collision_config(parts)
         return powered
