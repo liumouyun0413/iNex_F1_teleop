@@ -495,7 +495,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
             self._xr_last_change = now
         elif not self._xr_frozen and now - self._xr_last_change > 0.5:
             self._xr_frozen = True
-            print("[XR] ⚠️ 手柄数据流已 0.5 s 未更新（PICO 断流/应用后台？）：此期间 X+Y、扳机、摇杆均无效")
+            print("[XR] 手柄数据流已 0.5 s 未更新（PICO 断流/应用后台？）：此期间 X+Y、扳机、摇杆均无效")
 
     # ------------------------------------------------------------------ #
     # 按键：复位 / 腰
