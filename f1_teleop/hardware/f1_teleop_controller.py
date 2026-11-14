@@ -84,7 +84,8 @@ def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
 
 
 class F1RokaeTeleopController(HardwareTeleopController):
-    WARN_HAND_EPS_M = 3e-4   # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
+    WARN_HAND_EPS_M = 3e-4        # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
+    WARN_LOCK_MARGIN_M = 0.01     # WARN 中允许预测质心越出 warn 盒的深度；需 < stop 盒与 warn 盒的间距（3 cm）
 
     def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
         self.cfg = cfg
@@ -148,7 +149,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
-        self._warn_ref: Optional[float] = None   # WARN：进入时的驱动质心裕度（m）
+        self._warn_ref: Optional[np.ndarray] = None   # WARN：驱动质心 - 模型质心 的 xy 偏置（m），冻结时标定
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -613,51 +614,61 @@ class F1RokaeTeleopController(HardwareTeleopController):
         return new
 
     def _warn_step(self, ik_deg: np.ndarray) -> None:
-        """WARN 期间：默认冻结，但允许“往回收”。
+        """WARN 期间：冻结并重新锚定后，按“从头开始的增量遥操”继续，但只要目标构型的预测质心越出锁定盒就锁住。
 
         冻结 = planner.hold()（刹停到指令快照）+ 把 Placo 双臂回写为实际下发值 + 手柄参考重新锚定到该构型（离合打滑）。
-        放行判据用【操作者手柄本帧位移】沿越界方向的分量（激活臂中取最小，向内为正）：
-          向内 (> +ε)   → 放行（不论裕度，否则裕度恶化后无法回收→死锁）
-          中性 (|·| ≤ ε) → 横移/静止/慢推：放行，但驱动实测裕度比进入时恶化 >1 cm 即拒绝（慢推累积的闭环兑底）
-          向外 (< -ε)   → 拒绝：刹停 + 回写 + 重锚，前推量被吃掉
-        不用 IK 候选末端/模型质心做逐拍方向：另一臂的 IK 抖动 ±0.2 mm 和肘部抬起都会被误判为“向外”，重锚后目标误差归零、
-        IK 一阶响应被反复打断，回收变成远低于手速的蠕动（2026-11-14 诊断：放行 68/拒绝 17，步长 -0.2~+0.4 mm，臂几乎不动）。
+        放行判据：本拍 IK 候选构型的模型质心 + 偏置（驱动实测 - 模型，在指令构型上标定，每次冻结时刷新）落在
+        锁定盒（warn 盒向外扩 WARN_LOCK_MARGIN_M）内 → 正常遥操（回收/横移/小幅前推都连续跟随）；
+        越出 → 拒绝：刹停 + 回写 + 重锚，前推量被吃掉。锁定盒到 stop 盒之间是模型误差/滞后的余量，stop 盒是硬底线。
+        逃生口：指令构型本身已在锁定盒外（偏置刷新/动态超调）时，所有候选都在盒外会死锁，此时操作者明确回收（所有激活手柄不向外、
+        至少一只明显向内）也放行。
 
-        为什么被拒时必须重新锚定手柄参考：目标 = 锚定末端 + 手柄增量。臂冻结后手继续往前，目标跑到臂前方；手往回收只是
-        让目标靠近臂，IK 步仍然向外，要回收到越过冻结点臂才动——操作者感觉“锁死”。
+        弃用的逐拍方向判据（2026-11-14 实测）：模型质心符号（回收时肘部抬起，质心每步反而向外 0.04~0.34 mm → 锁死）、
+        IK 候选末端方向（另一臂 IK 抖动 ±0.2 mm 误拒 → 蠕动）、手柄每帧位移（另一只手的抖动 ±1~2 mm/帧，25% 误拒 → 蠕动）。
+        共同教训：逐拍拒绝会把 IK 一阶响应反复打断，判据必须是“构型落在哪里”而不是“这一步朝哪走”。
+        为什么被拒时必须重新锚定手柄参考：目标 = 锚定末端 + 手柄增量，否则臂冻结后目标跑到臂前方，要回收到越过冻结点臂才动。
         历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target → 自锁匀速漂走），必须用 hold()。"""
-        prev = self.arm.last_cmd_deg
-        if prev is None:
+        if self.arm.last_cmd_deg is None:
             self.arm.publish_hold_cmd(self.dt)
             return
-        d = self.com_guard.inward_dir()
-        mw, _ = self.com_guard.margin()
-        if self._warn_ref is None or not np.any(d):
+        if self._warn_ref is None:
             self._hold_and_revert()
-            if np.any(d):
-                self._warn_ref = mw
+            self._warn_ref = self._com_bias_xy()
             return
-        entry_margin = self._warn_ref
+        pred = self._placo_com_xy() + self._warn_ref                 # Placo 当前 = 本拍 IK 候选
+        m_pred = self.com_guard.margin(np.append(pred, 0.0))[0]
+        d = self.com_guard.inward_dir()
         steps = [float(np.dot(self.controller_step_xyz[n][:2], d)) for n in ARM_ORDER if self.active[n]]
-        hand = min(steps) if steps else 0.0
         eps = self.WARN_HAND_EPS_M
-        accept = hand > eps or (hand >= -eps and mw >= entry_margin - 0.01)
-        self._warn_dbg_update(accept, hand, mw - entry_margin)
+        retracting = bool(steps) and np.any(d) and min(steps) >= -eps and max(steps) > 3 * eps
+        accept = m_pred >= -self.WARN_LOCK_MARGIN_M or retracting
+        self._warn_dbg_update(accept, m_pred, self.com_guard.margin()[0])
         if accept:
             self.arm.publish_planned_cmd(ik_deg, self.dt)
             self._publish_ik_target(ik_deg)
             return
         self._hold_and_revert()
+        self._warn_ref = self._com_bias_xy()
 
-    def _warn_dbg_update(self, accept: bool, dproj: float, dmargin: float) -> None:
+    def _placo_com_xy(self) -> np.ndarray:
+        with self._placo_lock:
+            self.placo_robot.update_kinematics()      # solver.solve(True) 只写 q，不刷新运动学
+            return np.asarray(self.placo_robot.com_world())[:2].copy()
+
+    def _com_bias_xy(self) -> np.ndarray:
+        """驱动实测质心 - 模型质心（xy）；调用时 Placo 应已回写为指令构型。"""
+        p = self.com_guard.position
+        return (p[:2] if p is not None else np.zeros(2)) - self._placo_com_xy()
+
+    def _warn_dbg_update(self, accept: bool, m_pred: float, m_drv: float) -> None:
         """WARN 放行/拒绝的 1 Hz 诊断统计。"""
         st = self.__dict__.setdefault("_warn_dbg", {"t": time.monotonic(), "acc": 0, "rej": 0, "dp_min": 1e9, "dp_max": -1e9})
         st["acc" if accept else "rej"] += 1
-        st["dp_min"] = min(st["dp_min"], dproj); st["dp_max"] = max(st["dp_max"], dproj)
+        st["dp_min"] = min(st["dp_min"], m_pred); st["dp_max"] = max(st["dp_max"], m_pred)
         now = time.monotonic()
         if now - st["t"] >= 1.0:
-            print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 手柄沿越界方向的每帧位移(向内为正) "
-                  f"{st['dp_min']*1000:+.2f}~{st['dp_max']*1000:+.2f} mm | 驱动裕度变化 {dmargin*100:+.1f} cm")
+            print(f"[CoM] WARN 诊断: 放行 {st['acc']} / 拒绝 {st['rej']} 帧 | 候选构型预测质心距 warn 盒 "
+                  f"{st['dp_min']*100:+.1f}~{st['dp_max']*100:+.1f} cm (锁定线 {-self.WARN_LOCK_MARGIN_M*100:+.1f}) | 驱动实测 {m_drv*100:+.1f} cm")
             st.update(t=now, acc=0, rej=0, dp_min=1e9, dp_max=-1e9)
 
     def _hold_and_revert(self) -> None:
