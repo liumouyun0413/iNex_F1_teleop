@@ -200,6 +200,25 @@ chassis:                                   # 底盘未变，与 f1_tianji_teleop
   invert_angular_z: false
 
 # ----------------------------------------------------------------------------
+# iNex 原生整机质心保护（/inex/com_state，替代 cyb 质心门）。坐标系 chassis_link ≡ 驱动 universe ≡ URDF base_link
+# （原点 body_joint_1 轴，+X 前 +Z 上；2026-11-14 用 get_tf/tcp_pose 核实）。只用 position，velocity 字段是数值噪声。
+# 支撑矩形（轮心触地点，URDF）：x ∈ [-0.332, +0.128]，y ∈ ±0.218；质心离地 h ≈ 0.39 m，M ≈ 195 kg；
+# home 质心 (-0.013, -0.009, 0.181)，前方静态裕度仅 14 cm（轮距前短后长）。
+# 盒 = 支撑矩形内缩：stop 内缩 8 cm（坡度 3° 2.0 + 臂反力 1.2 + 模型误差 3 + 余量），warn 再内缩 3 cm。
+# 底盘加减速的等效偏移 a·h/g（0.8 m/s² → 3 cm）未计入：WARN/STOP 期间底盘被禁止。
+# z 不参与判断（给宽）。校核工具：scripts/check_com.py。
+com_guard:
+  enable: true
+  topic: /inex/com_state
+  stop_min: [-0.25, -0.14, -1.0]
+  stop_max: [ 0.05,  0.14,  1.0]
+  warn_min: [-0.22, -0.11, -1.0]
+  warn_max: [ 0.02,  0.11,  1.0]
+  timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
+  hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
+  hold_warn_sec: 0.3     # …且停留 0.3 s
+
+# ----------------------------------------------------------------------------
 safety:
   # cyb SafetyProtector 的模型为天机双臂 F1（f1_wheel URDF），与珞石臂几何不一致；
   # lxl 珞石版仍开着质心保护（use_com_guard=True）。默认关闭，确认模型适配后再开。

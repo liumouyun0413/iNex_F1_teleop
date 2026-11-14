@@ -30,6 +30,7 @@ F1RokaeTeleopController —— F1（珞石 Rokae 双臂 + iNex ROS2 驱动）真
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 
@@ -38,6 +39,7 @@ import numpy as np
 from f1_teleop.common.hardware_teleop_controller import HardwareTeleopController
 from f1_teleop.hardware.interface import (
     BagRecorder,
+    ComGuard,
     ExternalPoseInput,
     F1ChassisController,
     F1WaistController,
@@ -139,6 +141,10 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.external_input: Optional[ExternalPoseInput] = None
         self.recorder: Optional[RecordingManager] = None
         self.safety: Optional[SafetyGuard] = None
+        self.com_guard: Optional[ComGuard] = None
+        self._com_state = "OK"
+        self._com_last_print = 0.0
+        self._com_ref_proj: Optional[float] = None   # WARN 期间：上次被接受目标的模型质心在“向内方向”上的投影
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -351,6 +357,22 @@ class F1RokaeTeleopController(HardwareTeleopController):
                                     force_speed=None if fs is None else (int(fs[0]), int(fs[1])))
 
         # 5. 安全门（质心 + 碰撞）
+        cg = getattr(cfg, "com_guard", None)
+        if cg is not None and cg.enable:
+            self.com_guard = ComGuard(
+                self.ros, cg.topic, cg.stop_min, cg.stop_max, cg.warn_min, cg.warn_max,
+                timeout_ms=cg.timeout_ms, hysteresis_m=cg.hysteresis_m, hold_warn_sec=cg.hold_warn_sec,
+            )
+            if self.com_guard.wait_for_data(5.0):
+                p = self.com_guard.position; mw, ms = self.com_guard.margin()
+                print(f"[CoM] 质心保护已启用：当前 {np.round(p, 3)} m (M={self.com_guard.mass:.1f} kg) | 距 warn/stop 盒 {mw*100:.1f}/{ms*100:.1f} cm")
+                if ms < 0:
+                    raise RuntimeError("[CoM] 启动时质心已在 stop 盒外，请检查姿态/负载或放宽 com_guard 参数")
+                self.com_guard.arm()
+            else:
+                raise RuntimeError(f"[CoM] 未收到 {cg.topic}，com_guard.enable=true 时不允许无保护运行")
+        else:
+            print("[CoM] 质心保护未启用")
         if cfg.safety.enable:
             init_cmd = np.zeros(24)
             init_cmd[:14] = self.home_pose_deg
@@ -447,6 +469,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if self._xy_edge(x and y):
             self._start_reset()
             return
+        if self._com_state != "OK":
+            return  # 质心预警/停机期间禁止腰部升降
         if self._y_hold(y and not x):
             self.waist.step(True)
         if self._x_hold(x and not y):
@@ -463,9 +487,19 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print("[Reset] X+Y → 双臂复位")
             r = self.cfg.robot
             self._streaming = False
+            if self.com_guard is not None and self.com_guard.latched_stop:
+                # STOP 后已 halt：重新进 ServoJ 再回复位位姿（复位位姿是质心安全的）
+                for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
+                    self.inex.set_servo_mode(part)
             self.arm.move_to(self.reset_pose_deg, r.reset_duration_sec, r.move_rate_hz)
             self._sync_to_robot_pose(self.reset_pose_deg)
             self._self_check(self.reset_pose_deg)
+            if self.com_guard is not None and self.com_guard.latched_stop:
+                if self.com_guard.clear_latch():
+                    self._com_state = "OK"
+                    print("[CoM] 质心已回到安全区，停机闩锁解除")
+                else:
+                    print(f"[CoM] ❌ 质心仍在 warn 盒外 {np.round(self.com_guard.position, 3)}，保持停机；请检查腰部/负载后再 X+Y")
             print("[Reset] 完成")
         except Exception as e:
             print(f"[Reset] 异常: {e!r}")
@@ -519,6 +553,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
             self.chassis.disable()
 
         if self.chassis.enabled:
+            if self._com_state != "OK":
+                self.chassis.set_velocity_command(0.0, 0.0, 0.0)   # 质心预警/停机：底盘只允许停
+                return
             vx = self._axis(ly, c.deadzone, c.invert_linear_x) * c.max_linear
             vy = self._axis(lx, c.deadzone, c.invert_linear_y) * c.max_linear
             wz = self._axis(-rx, c.deadzone, c.invert_angular_z) * c.max_angular   # 左拨 = 逆时针为正
@@ -547,13 +584,53 @@ class F1RokaeTeleopController(HardwareTeleopController):
         msg.position = [float(v) for v in arm_deg]
         self._ik_target_pub.publish(msg)
 
+    def _update_com_guard(self) -> str:
+        """每拍评估质心状态；状态变化或 WARN/STOP 持续时限速打印。进入 STOP 时平滑制动。"""
+        if self.com_guard is None:
+            return "OK"
+        new = self.com_guard.evaluate()
+        now = time.monotonic()
+        if new != self._com_state or (new != "OK" and now - self._com_last_print > 2.0):
+            p = self.com_guard.position; mw, ms = self.com_guard.margin()
+            tag = {"OK": "✅", "WARN": "⚠️", "STOP": "❌"}[new]
+            print(f"[CoM] {tag} {new} 质心={None if p is None else np.round(p, 3)} 距 warn/stop 边界 {mw*100:.1f}/{ms*100:.1f} cm"
+                  + ("（双臂冻结、禁腰/底盘，回安全区自动恢复）" if new == "WARN" else
+                     "（已平滑制动，X+Y 复位后解除）" if new == "STOP" else ""))
+            self._com_last_print = now
+        if new == "STOP" and self._com_state != "STOP":
+            self._streaming = False
+            self.inex.halt()
+        if new != "WARN":
+            self._com_ref_proj = None
+        self._com_state = new
+        return new
+
+    def _warn_target(self, ik_deg: np.ndarray) -> np.ndarray:
+        """WARN 期间的目标选择：只接受使模型质心（URDF 惯性参数，Placo com_world）往盒内方向移动的 IK 目标，
+        否则冻结在上次下发值。这样操作者把手收回来能自动解除预警，继续往外伸则不跟。"""
+        prev = self.arm.last_cmd_deg
+        if prev is None:
+            return ik_deg
+        d = self.com_guard.inward_dir()
+        if not np.any(d):
+            return ik_deg
+        proj = float(np.dot(self.placo_robot.com_world()[:2], d))
+        if self._com_ref_proj is None or proj >= self._com_ref_proj - 1e-4:
+            self._com_ref_proj = proj
+            return ik_deg
+        return prev.copy()
+
     def _send_command(self) -> None:
         if not self._resetting.is_set():
+            com = self._update_com_guard()
             if any(self.active.values()):
                 self._streaming = True
-            if self._streaming:
+            if self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
+                # 质心 WARN：只接受质心向内的目标，其余冻结在上次下发值
                 arm_deg = self._placo_to_deg14()
+                if com == "WARN":
+                    arm_deg = self._warn_target(arm_deg)
                 if self.safety:
                     arm_deg = self.safety.filter(arm_deg)
                 if self.arm.planner is None:
