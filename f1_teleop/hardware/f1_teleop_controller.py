@@ -146,7 +146,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
-        self._com_ref_proj: Optional[float] = None   # WARN 期间：上次被接受目标的模型质心在“向内方向”上的投影
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -596,45 +595,29 @@ class F1RokaeTeleopController(HardwareTeleopController):
             p = self.com_guard.position; mw, ms = self.com_guard.margin()
             tag = {"OK": "✅", "WARN": "⚠️", "STOP": "❌"}[new]
             print(f"[CoM] {tag} {new} 质心={None if p is None else np.round(p, 3)} 距 warn/stop 边界 {mw*100:.1f}/{ms*100:.1f} cm"
-                  + ("（双臂冻结、禁腰/底盘，回安全区自动恢复）" if new == "WARN" else
+                  + ("（双臂冻结、禁腰/底盘；请 X+Y 复位，或等质心自行回到安全区）" if new == "WARN" else
                      "（已平滑制动，X+Y 复位后解除）" if new == "STOP" else ""))
             self._com_last_print = now
         if new == "STOP" and self._com_state != "STOP":
             self._streaming = False
             self.inex.halt()
-        if new != "WARN":
-            self._com_ref_proj = None
+        if self._com_state == "WARN" and new == "OK" and self.arm.last_cmd_deg is not None:
+            # 解除冻结：以当前下发构型重新锚定 Placo 与手柄参考，避免追向冻结前的旧目标而立刻再次越界
+            self._sync_to_robot_pose(self.arm.last_cmd_deg.copy())
         self._com_state = new
         return new
 
     def _warn_target(self, ik_deg: np.ndarray) -> np.ndarray:
-        """WARN 期间的目标选择：只接受使模型质心（URDF 惯性参数，Placo com_world）相对【当前冻结指令】往盒内
-        方向移动的 IK 目标；否则冻结在上次下发值，并把 Placo 双臂构型回写为该冻结值。
+        """WARN 期间：硬冻结。下发值固定为上次指令，并每拍把 Placo 双臂构型回写为该指令，
+        使 IK 状态不会跟着手柄跑远。解除只有两条路：X+Y 复位，或质心自行回到 warn 盒内（解除时重新锚定）。
 
-        回写是关键：若不回写，Placo 的 IK 状态会在冻结期间继续跟着手柄跑远，之后任何一次"被接受"（包括松开
-        握把时目标被设为 Placo 当前位姿）都会让真机一口气追到已跑远的构型——2026-11-14 实测出现手柄不动、
-        双臂自行前伸的现象，正是这个原因。回写后 IK 每拍只能从冻结构型前进一步，向外一步即被拒绝并撤销。"""
+        2026-11-14 两次实测否定了“只接受模型质心向内的目标”的软冻结：URDF 模型与驱动质心在毫米级上方向可以相反
+        （双臂前上抬时模型 x 减小、驱动 x 增大），导致手柄不动时双臂仍以 ~5 cm/s 朝旧目标缓慢前伸。"""
         prev = self.arm.last_cmd_deg
         if prev is None:
             return ik_deg
-        d = self.com_guard.inward_dir()
-        if not np.any(d):
-            return ik_deg
-        if self._com_ref_proj is None:
-            # 首拍：以真实下发构型为基准（IK 状态可能领先真机数度），本拍不动
-            self._revert_placo_arms(prev)
-            self._com_ref_proj = float(np.dot(self._placo_com_xy(), d))
-            return prev.copy()
-        proj = float(np.dot(self._placo_com_xy(), d))
-        if proj >= self._com_ref_proj - 1e-5:
-            self._com_ref_proj = proj
-            return ik_deg
         self._revert_placo_arms(prev)
         return prev.copy()
-
-    def _placo_com_xy(self) -> np.ndarray:
-        with self._placo_lock:
-            return np.asarray(self.placo_robot.com_world())[:2].copy()
 
     def _revert_placo_arms(self, arm_deg: np.ndarray) -> None:
         """把 Placo 双臂 q 回写为给定驱动角（不重置手柄参考，保持相对控制连续）。"""
@@ -651,7 +634,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 self._streaming = True
             if self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
-                # 质心 WARN：只接受质心向内的目标，其余冻结在上次下发值
+                # 质心 WARN：硬冻结在上次下发值（见 _warn_target）
                 arm_deg = self._placo_to_deg14()
                 if com == "WARN":
                     arm_deg = self._warn_target(arm_deg)

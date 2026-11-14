@@ -215,10 +215,12 @@ chassis:                                   # 底盘未变，与 f1_tianji_teleop
 com_guard:
   enable: true
   topic: /inex/com_state
+  # 2026-11-14 实测：双臂向前上方正常伸展（末端 x≈0.75, z≈0.6）质心 x 到 0.02~0.03；前向盒稍放宽 2 cm，
+  # stop 前边 0.07 距前轮触地点仍有 5.8 cm（坡度 3° 2.0 + 模型 1.4 + 臂反力 1.2 ≈ 4.6）；WARN/STOP 期间底盘被禁，不计底盘减速。
   stop_min: [-0.25, -0.14, -1.0]
-  stop_max: [ 0.05,  0.14,  1.0]
+  stop_max: [ 0.07,  0.14,  1.0]
   warn_min: [-0.22, -0.11, -1.0]
-  warn_max: [ 0.02,  0.11,  1.0]
+  warn_max: [ 0.04,  0.11,  1.0]
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
