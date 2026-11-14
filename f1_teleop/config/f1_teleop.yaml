@@ -110,9 +110,13 @@ inex:
   # 末端负载（/inex/set_payload，法兰系）：驱动用它算 /inex/com_state 整机质心（质心保护的输入）和阻抗重力补偿。
   # 2026-11-14 ms-thor 驱动默认：双臂 mass 2.2 kg, com [0.005, 0, 0.07] m, inertia 0（即夹爪）。换夹具/抓重物时改这里；
   # null = 沿用驱动当前值（启动时仍会打印）。
+  # 注意：驱动会记住上次 set_payload 的值（重启遥操不会复位），负载拆下后要显式写回夹爪值；null 只表示“本次不写”。
+  # 负重未装上时切勿先配置：不存在的负载会让 start_impedance 被拒（30003 力矩偏差），阻抗待命态下关节无保持力矩，
+  # 2026-11-14 实测双臂因此下垂 77°；同时质心保护会被虚假负载带偏。装上 5 kg（夹爪尖端，法兰 +z 0.20 m）后：
+  #   {mass: 7.2, com: [0.0015, 0.0, 0.160], inertia: [0,0,0,0,0,0]}   # 夹爪 2.2@z0.07 + 5@z0.20 合成
   payload:
-    left:  null                       # 例：{mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}
-    right: null
+    left:  {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}   # 仅夹爪
+    right: {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}
   # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
   # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
   impedance:

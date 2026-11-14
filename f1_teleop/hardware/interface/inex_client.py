@@ -206,11 +206,22 @@ class InexClient:
         # 在另一臂会话已开启时调用会把那只臂打回位置控制（2026-11-14 左臂先 start、再设右臂档 → 左臂不再柔顺）
         for part in parts:
             self.set_profile(part, PROFILE_JOINT_IMPEDANCE if part in impedance_parts else PROFILE_JOINT_POSITION)
+        failed = []
         for part in parts:
             if part in impedance_parts:
                 if joint_stiffness is not None:
                     self.set_joint_stiffness(part, joint_stiffness)
-                self.start_impedance(part)          # 文档：part 禁止 255，双臂顺序两次
+                if not self.start_impedance(part):     # 文档：part 禁止 255，双臂顺序两次
+                    failed.append(part)
+        if failed:
+            # 阻抗档“待命”(ARMED, execution_mask=0) 下关节无保持力矩且忽略 joint/ref：2026-11-14 配置了未装上的 5 kg
+            # 负载 → 30003 力矩偏差拒绝 → 双臂在待命态下垂 77°。失败必须退回位置档让臂保持住；set_motion_profile 会
+            # 打断另一臂已开启的会话，所以整组一起退回（先停会话再切档）。
+            print(f"[iNex] ❌ {'/'.join(PART_NAME.get(p, str(p)) for p in failed)} 阻抗启动失败，双臂退回 JOINT_POSITION 以保持位置"
+                  "（30003=力矩偏差过大：负载参数与实际不符或力矩传感器需标定）")
+            self.stop_impedance_sessions()
+            for part in impedance_parts:
+                self.set_profile(part, PROFILE_JOINT_POSITION)
         for part in parts:
             self.set_servo_mode(part, SERVO_MODE_J)
         self.print_collision_config(parts)
