@@ -330,8 +330,14 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if not self.arm.wait_for_state(timeout=inex_cfg.state_timeout_sec):
             raise RuntimeError(f"未收到 {ros_cfg.joint_state_topic}，iNex 驱动未启动？")
 
-        # 2. iNex 准备时序：心跳 → 上电 → 模式 → JOINT_POSITION → ServoJ
-        if not self.inex.prepare_arms():
+        # 2. iNex 准备时序：心跳 → 上电 → 模式 → 运动档（位置 / 关节阻抗）→ ServoJ
+        imp = getattr(inex_cfg, "impedance", None)
+        imp_parts: Tuple[int, ...] = ()
+        if imp is not None and imp.enable:
+            imp_parts = tuple({"left": PART_LEFT_ARM, "right": PART_RIGHT_ARM}[s] for s in imp.arms)
+            print(f"[Setup] ⚠️ 关节阻抗模式: {list(imp.arms)} 刚度={imp.joint_stiffness or '驱动默认'}（臂柔顺，跟踪误差大，需有人现场看护）")
+        if not self.inex.prepare_arms(impedance_parts=imp_parts,
+                                      joint_stiffness=(imp.joint_stiffness if imp_parts else None)):
             if inex_cfg.require_powered:
                 raise RuntimeError("双臂上电复核失败（inex.require_powered=true），终止启动")
         if self.inex.state == 3:
@@ -440,6 +446,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
             self.safety.stop()
         if self.inex and self.cfg.inex.halt_on_exit:
             self.inex.halt()
+        if self.inex:
+            self.inex.stop_impedance_sessions()
         if self.ros:
             self.ros.shutdown()
 

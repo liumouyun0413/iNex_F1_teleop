@@ -107,6 +107,12 @@ inex:
   gripper_state_hz: 30                # /inex/set_gripper_publish_frequency
   gripper_force_speed: null           # [force 20~100, speed 1~100]；null=沿用驱动默认
   halt_on_exit: true                  # 退出时 /inex/halt(part=0xFF) 平滑制动（不下电）
+  # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
+  # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
+  impedance:
+    enable: false
+    arms: [left]                      # left / right
+    joint_stiffness: null             # 7 个 Nm/rad；null=沿用驱动当前值
   # ServoJ 输出规划器（对应 lxl 桥接 send_loop）。天机版只靠末端摆率 + Placo 速度限制就够，
   # 珞石 iNex ServoJ 是位置流，lxl 注释反复强调"防底层报警"，故保留一层加速度/速度兑底：
   #   mode: clamp    = 只在超 vmax/amax 时夹住，不触限时输出恒等于 IK 目标，零附加延迟（默认）

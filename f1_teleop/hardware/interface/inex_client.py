@@ -16,7 +16,7 @@ InexClient —— iNex ROS2 (inex-ros2-v1.0.0_1.1.4) 服务/状态封装。
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from f1_teleop.hardware.interface.ros_context import RosContext
 
@@ -32,9 +32,12 @@ try:
         RobotMode,
         SetGripperForceSpeed,
         SetGripperPublishFrequency,
+        SetJointStiffness,
         SetMotionProfile,
         SetMotionServoMode,
         SetRobotMode,
+        StartImpedance,
+        StopImpedanceSession,
         StopSinglePointHeartbeat,
     )
 except ImportError as e:  # pragma: no cover
@@ -64,6 +67,7 @@ ROBOT_MODE_DUAL_ARM = 2
 ROBOT_MODE_WHOLE_BODY = 3
 # ---- MotionProfile / MotionServoMode ----
 PROFILE_JOINT_POSITION = 1
+PROFILE_JOINT_IMPEDANCE = 2
 SERVO_MODE_J = 4
 # ---- RobotSystemStatus.state ----
 STATE_IDLE, STATE_READY, STATE_RUNNING, STATE_ERROR = 0, 1, 2, 3
@@ -93,6 +97,10 @@ class InexClient:
         self._gripper_freq = node.create_client(SetGripperPublishFrequency, "/inex/set_gripper_publish_frequency")
         self._gripper_fs = node.create_client(SetGripperForceSpeed, "/inex/set_gripper_force_speed")
         self._get_collision = node.create_client(GetCollisionConfig, "/inex/get_collision_config")
+        self._set_stiffness = node.create_client(SetJointStiffness, "/inex/set_joint_stiffness")
+        self._start_impedance = node.create_client(StartImpedance, "/inex/start_impedance")
+        self._stop_impedance = node.create_client(StopImpedanceSession, "/inex/stop_impedance_session")
+        self.impedance_parts: Tuple[int, ...] = ()   # 已开启阻抗会话的分区（退出时 stop_impedance_session）
 
         self._powered_mask: Optional[int] = None
         self._robot_mode_cache: Optional[int] = None
@@ -174,8 +182,13 @@ class InexClient:
     # ------------------------------------------------------------------ #
     # 准备时序（lxl init_f1._prepare_system 的等价实现）
     # ------------------------------------------------------------------ #
-    def prepare_arms(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM)) -> bool:
-        """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → JOINT_POSITION → ServoJ。返回双臂是否确认上电。"""
+    def prepare_arms(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM),
+                     impedance_parts: Tuple[int, ...] = (),
+                     joint_stiffness: Optional[Sequence[float]] = None) -> bool:
+        """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → 运动档 → ServoJ。返回双臂是否确认上电。
+
+        impedance_parts 中的分区走关节阻抗档：READY 下热切 JOINT_IMPEDANCE → （可选）设关节刚度 → start_impedance（HOLD）→ ServoJ。
+        2026-11-14 ms-thor 实测：阻抗 HOLD（activity=3）下 set_motion_servo_mode(ServoJ) 返回 0。不标定力矩传感器。"""
         res = self._call(self._stop_heartbeat, StopSinglePointHeartbeat.Request(), "stop_single_point_heartbeat")
         print(f"[iNex] 关闭单点心跳 code={self._code(res)}")
 
@@ -184,7 +197,13 @@ class InexClient:
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
         for part in parts:
-            self.set_profile(part, PROFILE_JOINT_POSITION)
+            if part in impedance_parts:
+                self.set_profile(part, PROFILE_JOINT_IMPEDANCE)
+                if joint_stiffness is not None:
+                    self.set_joint_stiffness(part, joint_stiffness)
+                self.start_impedance(part)
+            else:
+                self.set_profile(part, PROFILE_JOINT_POSITION)
             self.set_servo_mode(part, SERVO_MODE_J)
         self.print_collision_config(parts)
         return powered
@@ -245,6 +264,29 @@ class InexClient:
         ok = res is not None and res.code == 0
         print(f"[iNex] {PART_NAME.get(part, part)} servo_mode={mode} {'✅' if ok else '❌ code=' + self._code(res)}")
         return ok
+
+    def set_joint_stiffness(self, part: int, stiffness: Sequence[float]) -> bool:
+        req = SetJointStiffness.Request(); req.part = part; req.stiffness = [float(k) for k in stiffness]
+        res = self._call(self._set_stiffness, req, "set_joint_stiffness")
+        ok = res is not None and res.code == 0
+        print(f"[iNex] {PART_NAME.get(part, part)} 关节刚度={list(req.stiffness)} Nm/rad {'✅' if ok else '❌ code=' + self._code(res)}")
+        return ok
+
+    def start_impedance(self, part: int) -> bool:
+        req = StartImpedance.Request(); req.part = part
+        res = self._call(self._start_impedance, req, "start_impedance", timeout=10.0)
+        ok = res is not None and res.code == 0
+        print(f"[iNex] {PART_NAME.get(part, part)} start_impedance {'✅' if ok else '❌ code=' + self._code(res)}")
+        if ok and part not in self.impedance_parts:
+            self.impedance_parts = self.impedance_parts + (part,)
+        return ok
+
+    def stop_impedance_sessions(self) -> None:
+        for part in self.impedance_parts:
+            req = StopImpedanceSession.Request(); req.part = part
+            res = self._call(self._stop_impedance, req, "stop_impedance_session", timeout=10.0)
+            print(f"[iNex] {PART_NAME.get(part, part)} stop_impedance_session code={self._code(res)}")
+        self.impedance_parts = ()
 
     def print_collision_config(self, parts) -> None:
         for part in parts:
