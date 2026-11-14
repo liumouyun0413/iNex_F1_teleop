@@ -158,6 +158,11 @@ teleop:
   max_ee_speed_m_s: 1.5
   max_ee_ang_speed_rad_s: 4.0
   workspace_radius: null     # 球形工作空间半径（m，球心为肩部 link）；null 不限制
+  # 地面保护（base_link 系，地面 z ≈ -0.205：前轮轴 -0.135 − 轮半径 0.07）：法兰原点与沿法兰 +z 延伸 tool_length 的
+  # 工具尖都不低于 floor_z_min，否则整体抬高 IK 目标。夹爪长约 0.2 m，留 0.1 m 余量 → -0.1。
+  # 2026-11-14 check_com sweep 把肘 J4 折到 34° 时夹爪触地（法兰 z=-0.057），故增加此项。
+  floor_z_min_m: -0.10
+  tool_length_m: 0.20
   # 下发每关节最大速度（°/s）：仅在 servo_planner.enable=false 时生效（规划器已含 vmax/amax）
   max_joint_speed_deg_s: 360.0
   gripper:

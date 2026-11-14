@@ -71,6 +71,8 @@ class BaseTeleopController(abc.ABC):
         manipulability_weight: float = 1e-4,
         joint_regularization_weight: float = 1.0,
         workspace_radius: Optional[float] = None,
+        floor_z_min: Optional[float] = None,
+        tool_length: float = 0.0,
         max_ee_speed: Optional[float] = None,
         max_ee_ang_speed: Optional[float] = None,
         enable_joint_velocity_limits: bool = False,
@@ -90,6 +92,8 @@ class BaseTeleopController(abc.ABC):
         self.manipulability_weight = manipulability_weight
         self.joint_regularization_weight = joint_regularization_weight
         self.workspace_radius = workspace_radius
+        self.floor_z_min = floor_z_min      # 末端法兰与工具尖在 base_link 系的最低 z（None 不限）
+        self.tool_length = float(tool_length)
         # 目标位姿摆率限制：PICO 数据流卡顿后会一次性跳变几十厘米，这里把跳变摆成限速追赶
         self.max_ee_step = None if max_ee_speed is None else float(max_ee_speed) * dt
         self.max_ee_ang_step = None if max_ee_ang_speed is None else float(max_ee_ang_speed) * dt
@@ -369,6 +373,7 @@ class BaseTeleopController(abc.ABC):
             target_xyz, target_quat = apply_delta_pose(ref_xyz, ref_quat, delta_xyz, delta_rot)
 
         target_xyz = self._clip_to_workspace(name, np.asarray(target_xyz, dtype=float))
+        target_xyz = self._clip_to_floor(target_xyz, target_quat)
 
         q_norm = np.linalg.norm(target_quat)
         if not np.isfinite(q_norm) or abs(q_norm - 1.0) > 0.01:
@@ -377,6 +382,19 @@ class BaseTeleopController(abc.ABC):
         T = tf.quaternion_matrix(target_quat)
         T[:3, 3] = target_xyz
         self.effector_task[name].T_world_frame = T
+
+    def _clip_to_floor(self, target_xyz: np.ndarray, target_quat) -> np.ndarray:
+        """地面保护：法兰原点和工具尖（法兰 +z 方向 tool_length）都不得低于 floor_z_min，不够则整体抬高目标。"""
+        if self.floor_z_min is None:
+            return target_xyz
+        tip_z = target_xyz[2]
+        if self.tool_length > 0:
+            R = tf.quaternion_matrix(target_quat)[:3, :3]
+            tip_z = min(tip_z, target_xyz[2] + R[2, 2] * self.tool_length)
+        if tip_z < self.floor_z_min:
+            target_xyz = target_xyz.copy()
+            target_xyz[2] += self.floor_z_min - tip_z
+        return target_xyz
 
     def _clip_to_workspace(self, name: str, target_xyz: np.ndarray) -> np.ndarray:
         """以肩部 link 为球心的球形工作空间限制（workspace_radius 为 None 时不限制）。"""

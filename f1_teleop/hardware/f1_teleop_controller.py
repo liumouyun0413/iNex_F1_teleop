@@ -107,6 +107,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
             manipulability_weight=t.ik.manipulability_weight,
             joint_regularization_weight=t.ik.joint_regularization_weight,
             workspace_radius=t.workspace_radius,
+            floor_z_min=getattr(t, "floor_z_min_m", None),
+            tool_length=float(getattr(t, "tool_length_m", 0.0) or 0.0),
             max_ee_speed=getattr(t, "max_ee_speed_m_s", None),
             max_ee_ang_speed=getattr(t, "max_ee_ang_speed_rad_s", None),
             enable_joint_velocity_limits=bool(getattr(t.ik, "enable_joint_velocity_limits", False)),

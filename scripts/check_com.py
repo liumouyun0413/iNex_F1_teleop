@@ -32,14 +32,32 @@ from f1_teleop.hardware.interface import ComGuard, InexArmController, InexClient
 SUPPORT_X = (-0.33156, 0.12828)
 SUPPORT_Y = (-0.218, 0.218)
 GROUND_Z = -0.13519 - 0.07
+TOOL_LEN = 0.20            # 法兰以外的夹爪长度（沿法兰 +z）
+FLOOR_CLEARANCE = 0.15     # sweep 位姿任一臂 link / 工具尖离地至少这么多，否则拒绝运动
 
-# sweep 目标位姿（驱动度，左 7 + 右 7）
+# sweep 目标位姿（驱动度，左 7 + 右 7）。★ 每个位姿都在运动前由 check_floor_clearance() 用 FK 复核。
+# 2026-11-14 教训：曾用“肘 J4 90→20”当作前伸，实际是前臂向下折，夹爪触地（J4≈34° 时法兰 z=-0.057）。
 POSES = {
-    # 肘 J4 90→20：前臂向前伸直，末端前移约 0.3 m
-    "forward": [90, 90, -90, 20, 0, 0, 0, -90, 90, 90, 20, 0, 0, 0],
+    # 肩 J1 90→45（右臂镜像 -45）：双臂向前上方抬起，法兰 (0.61, ±0.30, 0.78)，模型质心 x 前移 ≈ +2.4 cm
+    "forward": [45, 90, -90, 90, 0, 0, 0, -45, 90, 90, 90, 0, 0, 0],
     # 回零位
     "home": [90, 90, -90, 90, 0, 0, 0, -90, 90, 90, 90, 0, 0, 0],
 }
+ARM_FRAMES = ("link3", "link4", "link5", "link6", "link7", "flan_link")
+
+
+def check_floor_clearance(robot: placo.RobotWrapper, r, names: list[str], q_deg: np.ndarray) -> float:
+    """返回该位姿下所有臂 link 原点与工具尖的最小离地高度（m）。"""
+    for n, v in zip(names, q_deg):
+        robot.set_joint(n, float(np.deg2rad(v)))
+    robot.update_kinematics()
+    zmin = np.inf
+    for prefix in (r.left_ee_link.rsplit("_", 2)[0], r.right_ee_link.rsplit("_", 2)[0]):
+        for fr in ARM_FRAMES:
+            zmin = min(zmin, robot.get_T_world_frame(f"{prefix}_{fr}")[2, 3])
+        T = robot.get_T_world_frame(f"{prefix}_flan_link")
+        zmin = min(zmin, (T[:3, 3] + T[:3, 2] * TOOL_LEN)[2])
+    return float(zmin - GROUND_Z)
 
 
 def model_com(robot: placo.RobotWrapper, names: list[str], q_deg: np.ndarray) -> np.ndarray:
@@ -93,6 +111,13 @@ def main(mode: str = "static", pose: str = "forward", duration: float = 6.0, yes
     if pose not in POSES:
         print(f"--pose 应为 {list(POSES)}"); ros.shutdown(); return
     target = np.array(POSES[pose], dtype=float)
+    # 运动前必做：目标位姿与起点→目标的线性插值路径上，臂与工具尖离地高度复核
+    clearance = min(check_floor_clearance(robot, r, arm_names + body_names + head_names,
+                                          np.concatenate([q0[:14] + s * (target - q0[:14]), q0[14:]]))
+                    for s in np.linspace(0.0, 1.0, 21))
+    print(f"\n[安全] 路径上臂/工具尖最小离地 {clearance:.2f} m（要求 ≥ {FLOOR_CLEARANCE}）")
+    if clearance < FLOOR_CLEARANCE:
+        print("❌ 位姿会贴近/碰到地面，拒绝运动"); ros.shutdown(); return
     inex = InexClient(ros)
     if not inex.prepare_arms():
         print("❌ 双臂未确认上电"); ros.shutdown(); return
