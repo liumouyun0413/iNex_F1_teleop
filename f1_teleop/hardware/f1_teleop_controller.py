@@ -613,13 +613,14 @@ class F1RokaeTeleopController(HardwareTeleopController):
     def _warn_step(self, ik_deg: np.ndarray) -> None:
         """WARN 期间：默认冻结，但允许“往回收”。
 
-        冻结 = planner.hold()（刹停到进入时的指令快照）+ 每拍把 Placo 双臂回写为实际下发值。
-        放行条件（两条同时满足）：
-          1. 候选 IK 目标的模型质心（URDF 惯性参数）沿“向盒内方向”比进入 WARN 时的指令构型至少向内 2 mm
-             （基准固定为进入时的构型，死区 2 mm 吸收模型/驱动在毫米级的方向差异）；
-          2. 驱动实测质心到 warn 盒的裕度没有比进入时恶化超过 1 cm（闭环复核，模型判断错了就重新冻结）。
-        历史教训：① “不向外即放行”没有死区不可靠；② 被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式
-        err=0 时 v=v_target，v_target 又由目标增量估计 → 自锁匀速漂走），必须用 hold()。"""
+        冻结 = planner.hold()（刹停到进入时的指令快照）+ 把 Placo 双臂回写为实际下发值。
+        每拍把 IK 候选目标与【当前指令构型】比较（基准随指令更新，而不是固定在进入时刻——否则每拍回写后
+        IK 只能前进一小步，永远跨不过任何死区，实测表现为“手柄往回收双臂也不动”）。放行条件：
+          1. 候选目标的模型质心（URDF 惯性参数）沿“向盒内方向”比当前指令构型更靠内（纯方向判据，不设死区）；
+          2. 驱动实测质心到 warn 盒的裕度没有比进入时恶化超过 1 cm（闭环复核：模型方向判断错了最多再走 1 cm 就重新冻结）。
+        放行后指令只会单调向内（模型意义上），向外的一步立即被拒并撤销。
+        历史教训：被拒时绝不能把上一帧规划器输出当目标喂回去（clamp 模式 err=0 时 v=v_target，v_target 由目标增量
+        估计 → 自锁匀速漂走），必须用 hold()。"""
         prev = self.arm.last_cmd_deg
         if prev is None:
             self.arm.publish_hold_cmd(self.dt)
@@ -627,22 +628,26 @@ class F1RokaeTeleopController(HardwareTeleopController):
         d = self.com_guard.inward_dir()
         mw, _ = self.com_guard.margin()
         if self._warn_ref is None or not np.any(d):
-            # 进入拍：刹停，并以实际指令构型的模型质心为固定基准
-            self.arm.publish_hold_cmd(self.dt)
-            self._revert_placo_arms(self.arm.last_cmd_deg)
-            self._publish_ik_target(self.arm.last_cmd_deg)
+            self._hold_and_revert()
             if np.any(d):
                 self._warn_ref = (float(np.dot(self._placo_com_xy(), d)), mw)
             return
-        ref_proj, ref_margin = self._warn_ref
+        ref_proj, entry_margin = self._warn_ref
         proj = float(np.dot(self._placo_com_xy(), d))     # Placo 当前 = 本拍 IK 候选目标
-        if proj >= ref_proj + 0.002 and mw >= ref_margin - 0.01:
+        if proj > ref_proj + 1e-5 and mw >= entry_margin - 0.01:
             self.arm.publish_planned_cmd(ik_deg, self.dt)
             self._publish_ik_target(ik_deg)
+            self._warn_ref = (proj, entry_margin)
             return
+        self._hold_and_revert()
+        # 基准回到实际指令构型，下一拍只要比它更靠内就放行
+        self._warn_ref = (float(np.dot(self._placo_com_xy(), d)), entry_margin)
+
+    def _hold_and_revert(self) -> None:
         self.arm.publish_hold_cmd(self.dt)
-        self._revert_placo_arms(self.arm.last_cmd_deg)
-        self._publish_ik_target(self.arm.last_cmd_deg)
+        if self.arm.last_cmd_deg is not None:
+            self._revert_placo_arms(self.arm.last_cmd_deg)
+            self._publish_ik_target(self.arm.last_cmd_deg)
 
     def _placo_com_xy(self) -> np.ndarray:
         with self._placo_lock:
