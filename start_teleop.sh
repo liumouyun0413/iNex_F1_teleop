@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/log"
 TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${LOG_DIR}"
+find "${LOG_DIR}" -maxdepth 1 -name '*.log' -mtime +7 -delete 2>/dev/null   # 日志只保留 7 天
 
 # ---------------- 可按现场环境修改 ----------------
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
