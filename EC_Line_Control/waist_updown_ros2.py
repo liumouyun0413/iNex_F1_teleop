@@ -126,10 +126,12 @@ BODY_PART = 0                 # RobotPart: 0 = body
 # group is 3.  This node drives only the waist, so power just the 5 body motors
 # -- using ALL(0) would also energize both arms and the head.
 SERVO_GROUP_BODY = 3
-# 启动上电重试：stop 后立即 start 时，上一个节点 teardown 的 body 下电还在驱动内执行，此时 power_on 被拒（实测 code=-3，
-# 2026-11-17 六次启动三次复现）；等几秒再试即可。
+# 启动上电重试：驱动内 body 上电约需 0.8 s，ROS2 桥接的 power_change 对这类长操作常在 ~0.6 s 先返回 -3，
+# 而 robot_manager 日志显示上电实际已完成（2026-11-17 核实：“躯干 IDLE -> READY event=power_on_completed”）；
+# 再调一次幂等返回 0。所以 -3 按“进行中”处理，稍等后重试确认。
 POWER_ON_ATTEMPTS = 4
-POWER_RETRY_DELAY_S = 2.0
+POWER_RETRY_DELAY_S = 1.0
+POWER_CODE_IN_PROGRESS = -3
 ROBOT_MODE_WHOLE_BODY = 3     # controller::RobotMode WholeBody
 MOTION_PROFILE_JOINT_POSITION = 1
 # /inex/move_to action motion_type: JOINT(0) interpolates in joint space (the
@@ -559,11 +561,18 @@ class WaistUpDownController(Node):
                 self._powered = power_on
                 self.get_logger().info('%s%s返回 code=0' % (target, action))
                 return True
-            self.get_logger().error(
-                '%s%s失败 code=%s%s' % (target, action, res.code if res else 'NA',
-                                      '，%.1fs 后重试 (%d/%d)' % (POWER_RETRY_DELAY_S, i + 1, attempts)
-                                      if i + 1 < attempts else '')
-            )
+            code = res.code if res else 'NA'
+            if code == POWER_CODE_IN_PROGRESS and i + 1 < attempts:
+                self.get_logger().info(
+                    '%s%s返回 code=-3（驱动仍在执行），%.1fs 后确认 (%d/%d)'
+                    % (target, action, POWER_RETRY_DELAY_S, i + 1, attempts)
+                )
+            else:
+                self.get_logger().error(
+                    '%s%s失败 code=%s%s' % (target, action, code,
+                                          '，%.1fs 后重试 (%d/%d)' % (POWER_RETRY_DELAY_S, i + 1, attempts)
+                                          if i + 1 < attempts else '')
+                )
             if i + 1 < attempts:
                 time.sleep(POWER_RETRY_DELAY_S)
         return False

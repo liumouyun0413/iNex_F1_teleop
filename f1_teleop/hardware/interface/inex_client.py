@@ -77,6 +77,7 @@ STATE_IDLE, STATE_READY, STATE_RUNNING, STATE_ERROR = 0, 1, 2, 3
 ERR_SOFT_LIMIT = 40002
 ERR_MOTION_REJECTED = 41020
 ERR_BUSY = 10034
+ERR_POWER_IN_PROGRESS = -3   # power_change 长操作未在 RPC 窗口内完成，实际仍在执行（见 _wait_powered）
 
 PART_NAME = {PART_BODY: "躯干", PART_LEFT_ARM: "左臂", PART_RIGHT_ARM: "右臂", PART_HEAD: "头部"}
 
@@ -171,6 +172,7 @@ class InexClient:
         return ok
 
     def _power_on_retry(self, group: int, attempts: int = 3) -> bool:
+        bit = {GROUP_LEFT_ARM: MASK_LEFT_ARM, GROUP_RIGHT_ARM: MASK_RIGHT_ARM, GROUP_BODY: MASK_BODY}.get(group, 0)
         for i in range(attempts):
             req = PowerChange.Request(); req.power_on = True; req.group = group
             res = self._call(self._power_change, req, "power_change", timeout=30.0)
@@ -178,9 +180,24 @@ class InexClient:
             print(f"[iNex] power_on group={group} code={self._code(res)}")
             if code == 0:
                 return True
-            if code != ERR_BUSY:
+            if code == ERR_POWER_IN_PROGRESS and self._wait_powered(bit, 3.0):
+                return True
+            if code not in (ERR_BUSY, ERR_POWER_IN_PROGRESS):
                 return False
             time.sleep(1.5)   # Busy：上一组上电/复位尚未完成
+        return False
+
+    def _wait_powered(self, bit: int, timeout: float) -> bool:
+        """等 system_status.powered_mask 置位。上电在驱动内约 0.8 s，ROS2 桥接的 RPC 对这类长操作常先返回 -3（实际仍在执行并成功，
+        2026-11-17 robot_manager 日志核实），所以以掩码为准而不是返回码。"""
+        if not bit:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._powered_mask is not None and self._powered_mask & bit:
+                print(f"[iNex] power_on 已按 powered_mask 确认完成 mask={self._powered_mask:#04x}")
+                return True
+            time.sleep(0.1)
         return False
 
     # ------------------------------------------------------------------ #
