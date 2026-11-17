@@ -27,3 +27,10 @@ fi
 kill "$pid"
 rm -f "$PID_FILE"
 echo "Controller stop signal sent (PID: $pid)."
+# 等 teardown（halt + body 下电）做完再返回，否则紧接着的 start 会在下电进行中请求上电而被拒（code=-3）
+for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || { echo "Controller exited."; exit 0; }
+    sleep 0.5
+done
+echo "Controller did not exit within 15 s; killing." >&2
+kill -9 "$pid" 2>/dev/null || true

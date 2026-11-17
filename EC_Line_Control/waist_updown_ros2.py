@@ -126,6 +126,10 @@ BODY_PART = 0                 # RobotPart: 0 = body
 # group is 3.  This node drives only the waist, so power just the 5 body motors
 # -- using ALL(0) would also energize both arms and the head.
 SERVO_GROUP_BODY = 3
+# 启动上电重试：stop 后立即 start 时，上一个节点 teardown 的 body 下电还在驱动内执行，此时 power_on 被拒（实测 code=-3，
+# 2026-11-17 六次启动三次复现）；等几秒再试即可。
+POWER_ON_ATTEMPTS = 4
+POWER_RETRY_DELAY_S = 2.0
 ROBOT_MODE_WHOLE_BODY = 3     # controller::RobotMode WholeBody
 MOTION_PROFILE_JOINT_POSITION = 1
 # /inex/move_to action motion_type: JOINT(0) interpolates in joint space (the
@@ -463,7 +467,7 @@ class WaistUpDownController(Node):
             return False
         self.get_logger().info('已关闭单点运动心跳')
 
-        if self.power_on_at_startup and not self._set_power(True):
+        if self.power_on_at_startup and not self._set_power(True, attempts=POWER_ON_ATTEMPTS):
             return False
         if not self._apply_motion_mode():
             return False
@@ -543,21 +547,26 @@ class WaistUpDownController(Node):
         )
         return ok
 
-    def _set_power(self, power_on: bool) -> bool:
+    def _set_power(self, power_on: bool, attempts: int = 1) -> bool:
         req = PowerChange.Request()
         req.power_on = power_on
         req.group = self.power_group
-        res = self._call_service(self.cli_power, req, wait=True)
         action = '上电' if power_on else '下电'
         target = '整机' if self.power_group == 0 else '躯干(body)'
-        if res is None or res.code != 0:
+        for i in range(max(1, attempts)):
+            res = self._call_service(self.cli_power, req, wait=True)
+            if res is not None and res.code == 0:
+                self._powered = power_on
+                self.get_logger().info('%s%s返回 code=0' % (target, action))
+                return True
             self.get_logger().error(
-                '%s%s失败 code=%s' % (target, action, res.code if res else 'NA')
+                '%s%s失败 code=%s%s' % (target, action, res.code if res else 'NA',
+                                      '，%.1fs 后重试 (%d/%d)' % (POWER_RETRY_DELAY_S, i + 1, attempts)
+                                      if i + 1 < attempts else '')
             )
-            return False
-        self._powered = power_on
-        self.get_logger().info('%s%s返回 code=0' % (target, action))
-        return True
+            if i + 1 < attempts:
+                time.sleep(POWER_RETRY_DELAY_S)
+        return False
 
     # ------------------------------------------------------------------ #
     # Idle auto-power-off watchdog.  The waist motors must not stay energized
