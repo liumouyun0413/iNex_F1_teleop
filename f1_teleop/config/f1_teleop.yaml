@@ -117,6 +117,13 @@ inex:
   payload:
     left:  {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}   # 仅夹爪
     right: {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}
+  # 原生碰撞检测（/inex/set_collision_config，广义动量观测器估外力矩）：生效阈值 = left/right_params.yaml 基准 [30,25,8,7,4,3,3] Nm × 灵敏度%。
+  # 超阈去抖 3 ms → 驱动刹停并闩存，所有运动启动被拒（101），需 hot_reset（本程序：X+Y）。
+  # ⚠ 驱动只在【位置控制模式】下武装检测（collision_armed_part_mask：非位置/力控不检测），impedance.enable=true 时此功能无效。
+  # enable: null = 不改驱动当前设置（启动时仍打印）。
+  collision:
+    enable: null
+    sensitivity: [100, 100, 100, 100, 100, 100, 100]   # 1~200，J1..J7；越小越灵敏（阈值越低）
   # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
   # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
   impedance:
