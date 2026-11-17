@@ -53,7 +53,7 @@ from f1_teleop.hardware.interface import (
     ServoJPlanner,
     TianjiRecorderClient,
 )
-from f1_teleop.hardware.interface.inex_client import PART_LEFT_ARM, PART_RIGHT_ARM, STATE_ERROR
+from f1_teleop.hardware.interface.inex_client import PART_LEFT_ARM, PART_RIGHT_ARM
 from f1_teleop.utils.control_utils import HoldTrigger, JointMap, RateLimiter, RisingEdge
 
 ARM_ORDER = ("left_arm", "right_arm")
@@ -148,7 +148,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
-        self._driver_fault = False
         self._xr_last_ts = -1
         self._xr_last_change = time.monotonic()
         self._xr_frozen = False
@@ -342,8 +341,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print(f"[Setup] ⚠️ 关节阻抗模式: {list(imp.arms)} 刚度={imp.joint_stiffness or '驱动默认'}（臂柔顺，跟踪误差大，需有人现场看护）")
         if not self.inex.prepare_arms(impedance_parts=imp_parts,
                                       joint_stiffness=(imp.joint_stiffness if imp_parts else None),
-                                      payload_cfg=getattr(inex_cfg, "payload", None),
-                                      collision_cfg=getattr(inex_cfg, "collision", None)):
+                                      payload_cfg=getattr(inex_cfg, "payload", None)):
             if inex_cfg.require_powered:
                 raise RuntimeError("双臂上电复核失败（inex.require_powered=true），终止启动")
         if self.inex.state == 3:
@@ -526,14 +524,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print("[Reset] X+Y → 双臂复位")
             r = self.cfg.robot
             self._streaming = False
-            if self._driver_fault:
-                # 碰撞闩存/伺服故障：hot_reset → 上电 → 重新开阻抗 → ServoJ，再回复位位姿
-                if not self.inex.resume_after_fault():
-                    print("[Reset] ❌ 驱动故障未清除，放弃复位；请在 UI 做报警复位后再 X+Y")
-                    return
-                self._driver_fault = False
-                self.arm.anchor_planner()
-            elif self.com_guard is not None and self.com_guard.latched_stop:
+            if self.com_guard is not None and self.com_guard.latched_stop:
                 # STOP 后已 halt：重新进 ServoJ 再回复位位姿（复位位姿是质心安全的）
                 for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
                     self.inex.set_servo_mode(part)
@@ -730,13 +721,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
 
     def _send_command(self) -> None:
         if not self._resetting.is_set():
-            if self.inex.state == STATE_ERROR:
-                if not self._driver_fault:
-                    self._driver_fault = True
-                    self._streaming = False
-                    print("[iNex] ❌ 驱动进入 ERROR（碰撞检测触发/伺服故障）：停止下发；确认安全后按 X+Y 复位（hot_reset + 重新上电）")
-                self.chassis.publish()
-                return
             com = self._update_com_guard()
             if any(self.active.values()):
                 self._streaming = True

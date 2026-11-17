@@ -31,7 +31,6 @@ try:
         InitGripper,
         PowerChange,
         RobotMode,
-        SetCollisionConfig,
         SetGripperForceSpeed,
         SetGripperPublishFrequency,
         SetJointStiffness,
@@ -100,14 +99,12 @@ class InexClient:
         self._gripper_freq = node.create_client(SetGripperPublishFrequency, "/inex/set_gripper_publish_frequency")
         self._gripper_fs = node.create_client(SetGripperForceSpeed, "/inex/set_gripper_force_speed")
         self._get_collision = node.create_client(GetCollisionConfig, "/inex/get_collision_config")
-        self._set_collision = node.create_client(SetCollisionConfig, "/inex/set_collision_config")
         self._set_stiffness = node.create_client(SetJointStiffness, "/inex/set_joint_stiffness")
         self._start_impedance = node.create_client(StartImpedance, "/inex/start_impedance")
         self._stop_impedance = node.create_client(StopImpedanceSession, "/inex/stop_impedance_session")
         self._get_payload = node.create_client(GetPayload, "/inex/get_payload")
         self._set_payload = node.create_client(SetPayload, "/inex/set_payload")
         self.impedance_parts: Tuple[int, ...] = ()   # 已开启阻抗会话的分区（退出时 stop_impedance_session）
-        self._impedance_setup: Tuple[Tuple[int, ...], Optional[Sequence[float]]] = ((), None)   # 故障复位后重新开阻抗用
 
         self._powered_mask: Optional[int] = None
         self._robot_mode_cache: Optional[int] = None
@@ -192,7 +189,7 @@ class InexClient:
     def prepare_arms(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM),
                      impedance_parts: Tuple[int, ...] = (),
                      joint_stiffness: Optional[Sequence[float]] = None,
-                     payload_cfg=None, collision_cfg=None) -> bool:
+                     payload_cfg=None) -> bool:
         """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → 负载 → 运动档 → ServoJ。返回双臂是否确认上电。
 
         impedance_parts 中的分区走关节阻抗档：READY 下热切 JOINT_IMPEDANCE → （可选）设关节刚度 → start_impedance（HOLD）→ ServoJ。
@@ -205,14 +202,6 @@ class InexClient:
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
         self.apply_payloads(payload_cfg)
-        self.apply_collision_config(parts, collision_cfg)
-        self._impedance_setup = (tuple(impedance_parts), joint_stiffness)
-        self._arm_profiles_and_servo(parts, impedance_parts, joint_stiffness)
-        self.print_collision_config(parts)
-        return powered
-
-    def _arm_profiles_and_servo(self, parts: Tuple[int, ...], impedance_parts: Tuple[int, ...],
-                                joint_stiffness: Optional[Sequence[float]]) -> None:
         # 先把所有分区的运动档设好，再开阻抗会话：set_motion_profile 会重新 apply 控制模式，
         # 在另一臂会话已开启时调用会把那只臂打回位置控制（2026-11-14 左臂先 start、再设右臂档 → 左臂不再柔顺）
         for part in parts:
@@ -235,16 +224,8 @@ class InexClient:
                 self.set_profile(part, PROFILE_JOINT_POSITION)
         for part in parts:
             self.set_servo_mode(part, SERVO_MODE_J)
-
-    def resume_after_fault(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM)) -> bool:
-        """运行中驱动进 ERROR（碰撞闩锁、伺服故障…）后的恢复：hot_reset + 上电 → 按启动时的配置重新开阻抗 → ServoJ。
-        hot_reset 会结束阻抗会话；若只清错不重开，臂会停在阻抗待命态（无保持力矩）。"""
-        self.impedance_parts = ()
-        if not self.recover_from_error():
-            return False
-        imp_parts, stiffness = self._impedance_setup
-        self._arm_profiles_and_servo(parts, imp_parts, stiffness)
-        return self._state != STATE_ERROR
+        self.print_collision_config(parts)
+        return powered
 
     def _power_on_arms(self) -> bool:
         mask = self.powered_mask()
@@ -366,24 +347,6 @@ class InexClient:
             res = self._call(self._get_collision, req, "get_collision_config", timeout=2.0)
             if res is not None and res.code == 0:
                 print(f"[iNex] {PART_NAME.get(part, part)} 原生碰撞检测 enabled={res.enabled} params={list(res.params)}")
-
-    def set_collision_config(self, part: int, enable: bool, sensitivity: Sequence[int]) -> bool:
-        """广义动量观测器碰撞检测：sensitivity 为 7 个 1~200(%)，生效阈值 = left/right_params.yaml 基准 × 百分比。
-        注意：驱动只在位置控制模式下武装检测（collision_armed_part_mask：非位置模式/力控不检测），阻抗档下无效。"""
-        req = SetCollisionConfig.Request(); req.part = part; req.enable = bool(enable)
-        req.params = [int(v) for v in sensitivity]
-        res = self._call(self._set_collision, req, "set_collision_config")
-        ok = res is not None and res.code == 0
-        print(f"[iNex] {PART_NAME.get(part, part)} set_collision_config enable={req.enable} 灵敏度={list(req.params)}% "
-              f"{'✅' if ok else '❌ code=' + self._code(res)}")
-        return ok
-
-    def apply_collision_config(self, parts, collision_cfg) -> None:
-        if collision_cfg is None or getattr(collision_cfg, "enable", None) is None:
-            return
-        sens = getattr(collision_cfg, "sensitivity", None) or [100] * 7
-        for part in parts:
-            self.set_collision_config(part, collision_cfg.enable, sens)
 
     # ------------------------------------------------------------------ #
     # 查询 / 夹爪 / 制动
