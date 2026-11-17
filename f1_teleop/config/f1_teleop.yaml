@@ -248,11 +248,14 @@ com_guard:
 
 # ----------------------------------------------------------------------------
 safety:
-  # cyb SafetyProtector 的模型为天机双臂 F1（f1_wheel URDF），与珞石臂几何不一致；
-  # lxl 珞石版仍开着质心保护（use_com_guard=True）。默认关闭，确认模型适配后再开。
-  enable: false
-  enable_com_guard: true           # 质心保护
-  enable_collision_guard: false    # 手臂-机身碰撞检测
+  # cyb SafetyProtector（~/cyb_safe_control_real，默认配置 f1_2_safety_config.yaml → urdf_f1_2/F1_2_wheel 珞石臂模型）。
+  # 2026-11-17 用 Placo 对比 F1_2 URDF 与 huaqin URDF：各关节正负/零位一致，末端只差法兰 0.11 m，驱动角可直接喂入。
+  # 只开碰撞检测（手臂-机身/双臂互碰，MuJoCo 代理几何，不安全帧冻结双臂到最近安全指令）；
+  # 质心保护用 iNex 原生 /inex/com_state（上面 com_guard 段），这里保持关闭。
+  # 注意 cyb 配置里 collision_guard.gripper_length 默认 0.002（几乎不建夹爪体），实装夹爪 ≈0.20 m 时建议改为 0.20。
+  enable: true
+  enable_com_guard: false          # 质心保护（用 iNex 原生，不用 cyb）
+  enable_collision_guard: true     # 手臂-机身碰撞检测
   module_dir: /home/user/cyb_safe_control_real/cyb_dist/src/python
   check_rate_hz: 15.0
   warn_interval_sec: 3.0
