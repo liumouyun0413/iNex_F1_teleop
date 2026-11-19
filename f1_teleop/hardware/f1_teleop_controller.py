@@ -775,9 +775,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
         cmd_move = float(np.max(np.ptp(cmds, axis=0))); fb_move = float(np.max(np.ptp(fbs, axis=0)))
         if cmd_move < 5.0 or fb_move > 0.3:
             return False
-        print(f"[iNex] ❌ ServoJ 指令未被执行（1 s 内指令变化 {cmd_move:.1f}°，反馈 {fb_move:.2f}°）：驱动的 ServoJ 会话已被外部 halt 结束。"
-              "已知原因：iNex Web 界面获取控制权后即使不操作也会下发 halt(255)（Web 界面 bug，驱动工程师已确认），"
-              "请在 Web 界面释放控制权。现重新锚定到反馈并重新进入 ServoJ。")
+        print(f"[iNex] ❌ ServoJ 指令未被执行（1 s 内指令变化 {cmd_move:.1f}°，反馈 {fb_move:.2f}°）：驱动在静默丢弃我们的 ServoJ 流。"
+              "现重新锚定到反馈并重新进入 ServoJ。")
         self._streaming = False
         self._warn_ref = None
         self._sync_to_robot_pose(fb.copy())
