@@ -148,6 +148,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
         self._com_last_print = 0.0
+        self._sw_hist: list = []          # ServoJ 执行看门狗：(t, cmd14, fb14)
+        self._sw_last_check = 0.0
         self._xr_last_ts = -1
         self._xr_last_change = time.monotonic()
         self._xr_frozen = False
@@ -726,6 +728,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
             com = self._update_com_guard()
             if any(self.active.values()):
                 self._streaming = True
+            if self._streaming and com != "STOP" and self._servo_watchdog():
+                self.chassis.publish()
+                return
             if self._streaming and com == "WARN":
                 self._warn_step(self._placo_to_deg14())
             elif self._streaming and com != "STOP":
@@ -747,6 +752,38 @@ class F1RokaeTeleopController(HardwareTeleopController):
                     self.gripper_pos_target["left_arm"], self.gripper_pos_target["right_arm"]
                 )
         self.chassis.publish()
+
+    def _servo_watchdog(self) -> bool:
+        """ServoJ 流是否真的在被执行。返回 True 表示本拍已做恢复、调用方应跳过下发。
+
+        2026-11-19 实测：外部客户端（Web UI/桥接）发 halt(255)+stop_motion 后，驱动结束 plan 的 SERVO_J 会话但阻抗会话仍在
+        （state=RUNNING, activity=3），servo_cmd 被静默丢弃：指令走了 100°+，反馈纹丝不动，操作者只看到“双臂不动”。
+        判据：最近 1 s 内指令某关节变化 ≥5° 而所有关节反馈变化 <0.3°。恢复：Placo/规划器重新锚定到反馈（臂没动，无跳变）
+        → 重新 set_motion_servo_mode(ServoJ) → 等下次握把激活继续。"""
+        cmd = self.arm.last_cmd_deg
+        if cmd is None or not self.arm.has_state:
+            return False
+        now = time.monotonic()
+        fb = self.arm.get_arm_state_deg()
+        self._sw_hist.append((now, cmd.copy(), fb.copy()))
+        while self._sw_hist and now - self._sw_hist[0][0] > 1.0:
+            self._sw_hist.pop(0)
+        if now - self._sw_last_check < 0.2 or now - self._sw_hist[0][0] < 0.9:
+            return False
+        self._sw_last_check = now
+        cmds = np.array([h[1] for h in self._sw_hist]); fbs = np.array([h[2] for h in self._sw_hist])
+        cmd_move = float(np.max(np.ptp(cmds, axis=0))); fb_move = float(np.max(np.ptp(fbs, axis=0)))
+        if cmd_move < 5.0 or fb_move > 0.3:
+            return False
+        print(f"[iNex] ❌ ServoJ 指令未被执行（1 s 内指令变化 {cmd_move:.1f}°，反馈 {fb_move:.2f}°）：驱动的 ServoJ 会话已被结束"
+              "（外部 halt/stop_motion，如 Web UI）。重新锚定到反馈并重新进入 ServoJ。")
+        self._streaming = False
+        self._warn_ref = None
+        self._sync_to_robot_pose(fb.copy())
+        for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
+            self.inex.set_servo_mode(part)
+        self._sw_hist.clear()
+        return True
 
     # ------------------------------------------------------------------ #
     # 辅助线程（30Hz）：数采按键 + 主端数据镜像
