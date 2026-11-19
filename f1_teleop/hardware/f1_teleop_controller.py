@@ -507,9 +507,10 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if self._xy_edge(x and y):
             self._start_reset()
             return
-        if self._com_state != "OK":
-            return  # 质心预警/停机期间禁止腰部升降
-        if self._y_hold(y and not x):
+        # 质心 WARN：腰部只允许下降（X）——下降会降低并回收质心；上升（Y）仍禁止。STOP 期间全部禁止。
+        if self._com_state == "STOP":
+            return
+        if self._y_hold(y and not x) and self._com_state == "OK":
             self.waist.step(True)
         if self._x_hold(x and not y):
             self.waist.step(False)
@@ -632,7 +633,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
             p = self.com_guard.position; mw, ms = self.com_guard.margin()
             tag = {"OK": "✅", "WARN": "⚠️", "STOP": "❌"}[new]
             print(f"[CoM] {tag} {new} 质心={None if p is None else np.round(p, 3)} 距 warn/stop 边界 {mw*100:.1f}/{ms*100:.1f} cm"
-                  + ("（双臂冻结、禁腰/底盘；请 X+Y 复位，或等质心自行回到安全区）" if new == "WARN" else
+                  + ("（双臂冻结、禁腰升/底盘，可按 X 降腰回收质心；或 X+Y 复位、等质心自行回到安全区）" if new == "WARN" else
                      "（已平滑制动，X+Y 复位后解除）" if new == "STOP" else ""))
             self._com_last_print = now
         if new == "STOP" and self._com_state != "STOP":
