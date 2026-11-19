@@ -48,6 +48,11 @@ except ImportError as e:  # pragma: no cover
         "(例如 ~/workspace/inex_ros/install/setup.bash)，接口包需为 v1.0（含 ServoCommand）"
     ) from e
 
+try:  # 持物质心绑定：inex-ros2 v1.0.2 held-object-com-1.0.0 起才有，旧接口包上为 None
+    from inex_ros2_interface.srv import ClearHeldObject, GetHeldObject, SetHeldObject
+except ImportError:  # pragma: no cover
+    ClearHeldObject = GetHeldObject = SetHeldObject = None
+
 # ---- RobotPart（ServoCommand / SetMotionProfile / Halt 共用）----
 PART_BODY = 0
 PART_LEFT_ARM = 1
@@ -105,6 +110,11 @@ class InexClient:
         self._stop_impedance = node.create_client(StopImpedanceSession, "/inex/stop_impedance_session")
         self._get_payload = node.create_client(GetPayload, "/inex/get_payload")
         self._set_payload = node.create_client(SetPayload, "/inex/set_payload")
+        self._held_available = SetHeldObject is not None
+        if self._held_available:
+            self._get_held = node.create_client(GetHeldObject, "/inex/get_held_object")
+            self._set_held = node.create_client(SetHeldObject, "/inex/set_held_object")
+            self._clear_held = node.create_client(ClearHeldObject, "/inex/clear_held_object")
         self.impedance_parts: Tuple[int, ...] = ()   # 已开启阻抗会话的分区（退出时 stop_impedance_session）
 
         self._powered_mask: Optional[int] = None
@@ -206,7 +216,7 @@ class InexClient:
     def prepare_arms(self, parts: Tuple[int, ...] = (PART_LEFT_ARM, PART_RIGHT_ARM),
                      impedance_parts: Tuple[int, ...] = (),
                      joint_stiffness: Optional[Sequence[float]] = None,
-                     payload_cfg=None) -> bool:
+                     payload_cfg=None, held_cfg=None) -> bool:
         """关闭心跳 → 上电（按掩码补齐）→ 机器人模式 → 负载 → 运动档 → ServoJ。返回双臂是否确认上电。
 
         impedance_parts 中的分区走关节阻抗档：READY 下热切 JOINT_IMPEDANCE → （可选）设关节刚度 → start_impedance（HOLD）→ ServoJ。
@@ -219,6 +229,7 @@ class InexClient:
         powered = self._power_on_arms()
         self._ensure_robot_mode(ROBOT_MODE_DUAL_ARM)
         self.apply_payloads(payload_cfg)
+        self.apply_held_objects(held_cfg)
         # 先把所有分区的运动档设好，再开阻抗会话：set_motion_profile 会重新 apply 控制模式，
         # 在另一臂会话已开启时调用会把那只臂打回位置控制（2026-11-14 左臂先 start、再设右臂档 → 左臂不再柔顺）
         for part in parts:
@@ -357,6 +368,59 @@ class InexClient:
             else:
                 print(f"[iNex] {PART_NAME[part]} 负载: configured={cur.configured} mass={cur.mass:.3f} kg "
                       f"com={[round(float(v), 4) for v in cur.com]} m" + ("" if spec is not None else "（沿用驱动当前值）"))
+
+    # ------------------------------------------------------------------ #
+    # 持物质心绑定（/inex/*_held_object）：只参与 /inex/com_state 整机质心（质心保护的输入），
+    # 不进重力补偿（文档"动力学接入另行设计"）；控制器重启后清零，遥操重启不会清，因此 null 时显式解绑。
+    # 注意：同一件重物不要既算进 payload 又登记为 held_object，会被计两次。
+    # ------------------------------------------------------------------ #
+    def get_held_objects(self):
+        if not self._held_available:
+            return None
+        res = self._call(self._get_held, GetHeldObject.Request(), "get_held_object", timeout=2.0)
+        return res if (res is not None and res.code == 0) else None
+
+    def set_held_object(self, part: int, mass: float, com: Sequence[float],
+                        inertia: Optional[Sequence[float]] = None) -> bool:
+        req = SetHeldObject.Request()
+        req.part = part; req.mass = float(mass)
+        req.com = [float(v) for v in com]
+        req.inertia = [float(v) for v in (inertia if inertia is not None else (0.0,) * 6)]
+        if len(req.com) != 3 or len(req.inertia) != 6 or not req.mass > 0:
+            raise ValueError(f"held_object 需 mass>0、com 3 个值、inertia 6 个值（{PART_NAME.get(part, part)}）")
+        res = self._call(self._set_held, req, "set_held_object", timeout=5.0)
+        ok = res is not None and res.code == 0
+        print(f"[iNex] {PART_NAME.get(part, part)} set_held_object mass={req.mass} com={list(req.com)}（法兰系） "
+              f"{'✅' if ok else '❌ code=' + self._code(res)}")
+        return ok
+
+    def clear_held_object(self, part: int) -> bool:
+        req = ClearHeldObject.Request(); req.part = part
+        res = self._call(self._clear_held, req, "clear_held_object", timeout=5.0)
+        ok = res is not None and res.code == 0
+        if not ok:
+            print(f"[iNex] {PART_NAME.get(part, part)} clear_held_object ❌ code={self._code(res)}")
+        return ok
+
+    def apply_held_objects(self, held_cfg) -> None:
+        """inex.held_object.left/right：{mass, com[3], inertia[6]} 登记，null 解绑；之后打印两臂当前绑定。"""
+        if not self._held_available:
+            if held_cfg is not None and any(getattr(held_cfg, s, None) is not None for s in ("left", "right")):
+                print("[iNex] ⚠️ 接口包无 SetHeldObject（需 inex-ros2 held-object-com 版本），忽略 held_object 配置")
+            return
+        for side, part in (("left", PART_LEFT_ARM), ("right", PART_RIGHT_ARM)):
+            spec = getattr(held_cfg, side, None) if held_cfg is not None else None
+            if spec is not None:
+                self.set_held_object(part, spec.mass, spec.com, getattr(spec, "inertia", None))
+            else:
+                self.clear_held_object(part)
+        cur = self.get_held_objects()
+        if cur is None:
+            print("[iNex] 持物绑定查询失败")
+            return
+        for side, cfgd, m, c in (("左臂", cur.left_configured, cur.left_mass, cur.left_com),
+                                 ("右臂", cur.right_configured, cur.right_mass, cur.right_com)):
+            print(f"[iNex] {side} 持物: " + (f"{m:.3f} kg com={[round(float(v), 4) for v in c]} m（法兰系）" if cfgd else "无"))
 
     def print_collision_config(self, parts) -> None:
         for part in parts:

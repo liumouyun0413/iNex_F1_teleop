@@ -117,6 +117,16 @@ inex:
   payload:
     left:  {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}   # 仅夹爪
     right: {mass: 2.2, com: [0.005, 0.0, 0.07], inertia: [0, 0, 0, 0, 0, 0]}
+  # 持物质心绑定（/inex/set_held_object，inex-ros2 held-object-com-1.0.0 起）：只计入 /inex/com_state 整机质心，不进重力补偿。
+  # com 为法兰系“法兰原点→物体质心”偏移：本机法兰 +z 沿工具方向，夹爪指尖约 0.20 m，夹在指尖的物体填 [0, 0, 0.20(+物体半长)]。
+  # 两种用法二选一，不要叠加（会被计两次）：
+  #   A) 位置模式或物体经常取放：payload 保持夹爪 2.2，held_object 登记物体（如 5 kg @ [0,0,0.20]）；
+  #   B) 关节阻抗模式：重力补偿只认 payload，物体要合进 payload（夹爪 2.2@z0.07 + 5@z0.20 → 7.2 kg @ [0.0015,0,0.160]），held_object 留 null，
+  #      否则 start_impedance 会因力矩偏差超 30 Nm 被拒（30003）。
+  # null = 解绑（驱动在遥操重启间会保留上次绑定，故显式清除）。
+  held_object:
+    left:  null                       # 例：{mass: 5.0, com: [0.0, 0.0, 0.20], inertia: [0, 0, 0, 0, 0, 0]}
+    right: null
   # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
   # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
   impedance:
@@ -257,7 +267,7 @@ safety:
   enable_com_guard: false          # 质心保护（用 iNex 原生，不用 cyb）
   enable_collision_guard: true     # 手臂-机身碰撞检测
   module_dir: /home/user/cyb_safe_control_real/cyb_dist/src/python
-  check_rate_hz: 15.0
+  check_rate_hz: 30.0
   warn_interval_sec: 3.0
   body_joint_order_reversed: true  # lxl 珞石版（2026-10-16）确认 SafetyProtector 腰段为 j5..j1 反序
 

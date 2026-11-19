@@ -341,7 +341,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print(f"[Setup] ⚠️ 关节阻抗模式: {list(imp.arms)} 刚度={imp.joint_stiffness or '驱动默认'}（臂柔顺，跟踪误差大，需有人现场看护）")
         if not self.inex.prepare_arms(impedance_parts=imp_parts,
                                       joint_stiffness=(imp.joint_stiffness if imp_parts else None),
-                                      payload_cfg=getattr(inex_cfg, "payload", None)):
+                                      payload_cfg=getattr(inex_cfg, "payload", None),
+                                      held_cfg=getattr(inex_cfg, "held_object", None)):
             if inex_cfg.require_powered:
                 raise RuntimeError("双臂上电复核失败（inex.require_powered=true），终止启动")
         if self.inex.state == 3:
