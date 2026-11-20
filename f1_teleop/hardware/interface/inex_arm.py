@@ -353,15 +353,12 @@ class InexArmController:
             pub.publish(msg)
         self.last_gripper_cmd = [float(left), float(right)]
 
-    def move_to(self, target_deg: Sequence[float], duration_sec: float, rate_hz: float = 50.0,
-                start_deg: Optional[Sequence[float]] = None) -> bool:
-        """S 曲线插值到目标（阻塞，逐帧定时，绝不连发追赶）。起点默认真机反馈；start_deg 指定时从该点起步。"""
+    def move_to(self, target_deg: Sequence[float], duration_sec: float, rate_hz: float = 50.0) -> bool:
+        """从真机当前反馈 S 曲线插值到目标（阻塞，逐帧定时，绝不连发追赶）。"""
         target = np.asarray(target_deg, dtype=float)
         if target.shape != (14,):
             raise ValueError("move_to 目标应为 14 维")
-        if start_deg is not None:
-            start = np.asarray(start_deg, dtype=float).copy()
-        elif self.has_state:
+        if self.has_state:
             start = self.get_arm_state_deg()
         elif self.last_cmd_deg is not None:
             start = self.last_cmd_deg.copy()
