@@ -85,6 +85,7 @@ def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
 
 class F1RokaeTeleopController(HardwareTeleopController):
     WARN_HAND_EPS_M = 3e-4        # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
+    RESET_START_MAX_DEV_DEG = 20.0  # 复位从最后指令起步的允许指令-反馈偏差；超过说明指令早已不被执行，改从反馈起步
 
     def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
         self.cfg = cfg
@@ -541,7 +542,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 # STOP 后已 halt：重新进 ServoJ 再回复位位姿（复位位姿是质心安全的）
                 for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
                     self.inex.set_servo_mode(part)
-            self.arm.move_to(self.reset_pose_deg, r.reset_duration_sec, r.move_rate_hz)
+            self.arm.move_to(self.reset_pose_deg, r.reset_duration_sec, r.move_rate_hz, start_deg=self._reset_start_deg())
             self._sync_to_robot_pose(self.reset_pose_deg)
             self._self_check(self.reset_pose_deg)
             if self.com_guard is not None and self.com_guard.latched_stop:
@@ -555,6 +556,23 @@ class F1RokaeTeleopController(HardwareTeleopController):
             print(f"[Reset] 异常: {e!r}")
         finally:
             self._resetting.clear()
+
+    def _reset_start_deg(self) -> Optional[np.ndarray]:
+        """复位起点。阻抗模式下驱动的参考位置 = 我们最后一帧 ServoJ，而反馈因负载下的静态偏转与它差几度
+        （J7 刚度 25 Nm/rad 持 5 kg 箱实测 3.6°）；若从反馈起步，首帧就是一次参考跳变 → 驱动 40001009 “阻抗参考跳变”
+        （阈值 0.05 rad）杀掉该臂阻抗会话（2026-11-20 实测：右臂复位、左臂纹丝不动）。故从最后指令起步；指令与反馈偏差异常大
+        （会话已丢、指令早已漂走）时回退到反馈。"""
+        cmd = self.arm.last_cmd_deg
+        if cmd is None or not self.arm.has_state:
+            return None
+        fb = self.arm.get_arm_state_deg()
+        dev = np.abs(cmd - fb)
+        j = int(np.argmax(dev))
+        if dev[j] > self.RESET_START_MAX_DEV_DEG:
+            print(f"[Reset] 指令与反馈偏差 {dev[j]:.1f}°（{'L' if j < 7 else 'R'} J{j % 7 + 1}）过大，改从反馈起步")
+            return None
+        print(f"[Reset] 从最后 ServoJ 指令起步（与反馈最大偏差 {dev[j]:.1f}° @ {'L' if j < 7 else 'R'} J{j % 7 + 1}）")
+        return cmd.copy()
 
     # ------------------------------------------------------------------ #
     # 头部
@@ -795,6 +813,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._streaming = False
         self._warn_ref = None
         self._sync_to_robot_pose(fb.copy())
+        self.arm.last_cmd_deg = fb.copy()      # 漂走的指令从未被执行，驱动参考 ≈ 反馈
         for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
             self.inex.set_servo_mode(part)
         self._sw_hist.clear()
