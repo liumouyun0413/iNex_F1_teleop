@@ -49,13 +49,11 @@ class ComGuard:
         tcp_z_gate_m: Optional[float] = None,
         tcp_z_gate_hyst_m: float = 0.02,
         tcp_topic: str = "/inex/tcp_pose",
+        low_boxes: Optional[Tuple[Sequence[float], Sequence[float], Sequence[float], Sequence[float]]] = None,
     ) -> None:
-        self.stop_min = np.asarray(stop_min, dtype=float)
-        self.stop_max = np.asarray(stop_max, dtype=float)
-        self.warn_min = np.asarray(warn_min, dtype=float)
-        self.warn_max = np.asarray(warn_max, dtype=float)
-        if not (np.all(self.stop_min <= self.warn_min) and np.all(self.warn_max <= self.stop_max)):
-            raise ValueError("ComGuard: warn 盒必须包含在 stop 盒内")
+        self._boxes_high = self._make_boxes(stop_min, stop_max, warn_min, warn_max, "高位")
+        self._boxes_low = None if low_boxes is None else self._make_boxes(*low_boxes, "低位")
+        self.stop_min, self.stop_max, self.warn_min, self.warn_max = self._boxes_high
         self.timeout = float(timeout_ms) / 1000.0
         self.hyst = float(hysteresis_m)
         self.hold_warn = float(hold_warn_sec)
@@ -83,6 +81,20 @@ class ComGuard:
             ros.node.create_subscription(TcpPosition, tcp_topic, self._on_tcp, qos_profile_sensor_data)
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _make_boxes(stop_min, stop_max, warn_min, warn_max, tag: str):
+        b = tuple(np.asarray(v, dtype=float) for v in (stop_min, stop_max, warn_min, warn_max))
+        if not (np.all(b[0] <= b[2]) and np.all(b[3] <= b[1])):
+            raise ValueError(f"ComGuard: {tag} warn 盒必须包含在 stop 盒内")
+        return b
+
+    @property
+    def zone(self) -> str:
+        """当前生效的盒：'high'（门开）/ 'low'（门关且配了低位盒）/ 'off'（门关、无低位盒，不干预）。"""
+        if self._gate_open:
+            return "high"
+        return "low" if self._boxes_low is not None else "off"
+
     def _on_msg(self, msg: ComState) -> None:
         with self._lock:
             self._n_msgs += 1
@@ -129,6 +141,8 @@ class ComGuard:
                 self._gate_open = False
         elif np.any(z > self.tcp_gate):
             self._gate_open = True
+        boxes = self._boxes_high if (self._gate_open or self._boxes_low is None) else self._boxes_low
+        self.stop_min, self.stop_max, self.warn_min, self.warn_max = boxes
         return self._gate_open
 
     def arm(self) -> None:
@@ -199,8 +213,8 @@ class ComGuard:
             stale = self._armed and (p is None or age > self.timeout)
         if self._latched_stop:
             return STATE_STOP
-        if not self._update_gate(now):
-            self._state = STATE_OK                          # 门关：不判 WARN/STOP，也不计超时
+        if not self._update_gate(now) and self._boxes_low is None:
+            self._state = STATE_OK                          # 门关且无低位盒：不判 WARN/STOP，也不计超时
             self._stop_viol = 0
             return STATE_OK
         if stale:

@@ -378,16 +378,20 @@ class F1RokaeTeleopController(HardwareTeleopController):
         # 5. 安全门（质心 + 碰撞）
         cg = getattr(cfg, "com_guard", None)
         if cg is not None and cg.enable:
+            lz = getattr(cg, "low_zone", None)
+            low_boxes = None if lz is None else (lz.stop_min, lz.stop_max, lz.warn_min, lz.warn_max)
             self.com_guard = ComGuard(
                 self.ros, cg.topic, cg.stop_min, cg.stop_max, cg.warn_min, cg.warn_max,
                 timeout_ms=cg.timeout_ms, hysteresis_m=cg.hysteresis_m, hold_warn_sec=cg.hold_warn_sec,
                 tcp_z_gate_m=getattr(cg, "tcp_z_gate_m", None),
                 tcp_z_gate_hyst_m=getattr(cg, "tcp_z_gate_hyst_m", 0.02),
                 tcp_topic=getattr(cg, "tcp_topic", "/inex/tcp_pose"),
+                low_boxes=low_boxes,
             )
             self._warn_lock_m = float(getattr(cg, "lock_margin_m", self._warn_lock_m))
-            gap = float(np.min(np.minimum(self.com_guard.warn_min - self.com_guard.stop_min,
-                                          self.com_guard.stop_max - self.com_guard.warn_max)[:2]))
+            boxes = [(cg.stop_min, cg.stop_max, cg.warn_min, cg.warn_max)] + ([low_boxes] if low_boxes else [])
+            gap = min(float(np.min(np.minimum(np.asarray(wn) - np.asarray(sn), np.asarray(sx) - np.asarray(wx))[:2]))
+                      for sn, sx, wn, wx in boxes)
             if not 0.0 <= self._warn_lock_m < gap:
                 raise RuntimeError(f"[CoM] com_guard.lock_margin_m={self._warn_lock_m} 必须在 [0, warn→stop 间距 {gap:.3f}) 内")
             if self.com_guard.wait_for_data(5.0):
@@ -395,7 +399,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 print(f"[CoM] 质心保护已启用：当前 {np.round(p, 3)} m (M={self.com_guard.mass:.1f} kg) | 距 warn/stop 盒 {mw*100:.1f}/{ms*100:.1f} cm")
                 if self.com_guard.tcp_gate is not None:
                     z = self.com_guard.tcp_z
-                    print(f"[CoM] 末端高度门：任一臂 TCP z > {self.com_guard.tcp_gate:.2f} m 即执行保护，双臂都低于则暂停（回差 {self.com_guard.tcp_gate_hyst*100:.0f} cm）；"
+                    low = "切到低位宽限盒 warn_max x=%.3f / stop_max x=%.3f" % (low_boxes[3][0], low_boxes[1][0]) if low_boxes else "暂停保护"
+                    print(f"[CoM] 末端高度门：任一臂 TCP z > {self.com_guard.tcp_gate:.2f} m 用高位盒，双臂都低于则{low}（回差 {self.com_guard.tcp_gate_hyst*100:.0f} cm）；"
                           f"当前 左/右 z = {z[0]:.3f}/{z[1]:.3f} m")
                 if ms < 0:
                     raise RuntimeError("[CoM] 启动时质心已在 stop 盒外，请检查姿态/负载或放宽 com_guard 参数")
@@ -644,7 +649,10 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if gate != self._com_gate_open:
             z = self.com_guard.tcp_z
             zs = "?" if z is None else f"{z[0]:.2f}/{z[1]:.2f}"
-            print(f"[CoM] 末端高度门{'打开，质心保护生效' if gate else '关闭，质心保护暂停'}（左/右 TCP z = {zs} m，阈值 {self.com_guard.tcp_gate:.2f}）")
+            desc = {"high": "打开，用高位盒", "low": "关闭，用低位宽限盒", "off": "关闭，质心保护暂停"}[self.com_guard.zone]
+            mw, ms = self.com_guard.margin()
+            print(f"[CoM] 末端高度门{desc}（左/右 TCP z = {zs} m，阈值 {self.com_guard.tcp_gate:.2f}）；"
+                  f"当前盒 warn_max x={self.com_guard.warn_max[0]:.3f} stop_max x={self.com_guard.stop_max[0]:.3f}，质心距 warn/stop {mw*100:.1f}/{ms*100:.1f} cm")
             self._com_gate_open = gate
         if new != self._com_state or (new != "OK" and now - self._com_last_print > 2.0):
             p = self.com_guard.position; mw, ms = self.com_guard.margin()
