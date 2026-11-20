@@ -411,20 +411,16 @@ class F1RokaeTeleopController(HardwareTeleopController):
         else:
             print("[CoM] 质心保护未启用")
         if cfg.safety.enable:
-            init_cmd = np.zeros(24)
-            init_cmd[:14] = self.home_pose_deg
-            init_cmd[14:22] = self._body_state_deg()
             self.safety = SafetyGuard(
-                module_dir=cfg.safety.module_dir,
-                body_state_deg_getter=self._body_state_deg,
-                initial_cmd_deg=init_cmd,
-                enable_com_guard=cfg.safety.enable_com_guard,
-                enable_collision_guard=cfg.safety.enable_collision_guard,
-                check_rate_hz=cfg.safety.check_rate_hz,
+                self.ros,
+                topic=getattr(cfg.safety, "is_safe_topic", "/f1_safety/is_safe"),
+                initial_cmd_deg=self.home_pose_deg,
                 warn_interval_sec=cfg.safety.warn_interval_sec,
+                stale_timeout_sec=float(getattr(cfg.safety, "stale_timeout_sec", 0.5)),
+                wait_timeout_sec=float(getattr(cfg.safety, "wait_timeout_sec", 5.0)),
             )
         else:
-            print("[Setup] ⚠️ 安全门已禁用（无质心/碰撞保护）")
+            print("[Setup] ⚠️ 安全门已禁用（不订阅碰撞检测结果）")
 
     def _check_feedback_inside_soft_limits(self) -> None:
         """反馈在驱动软限位外时任何 ServoJ/PTP 都会被拒并使整机掉电（2026-11-13 R-J4 141° 实例），回零前必须先用 jog 拉回。"""

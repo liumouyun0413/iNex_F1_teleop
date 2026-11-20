@@ -34,7 +34,7 @@ f1_rokae_teleop/
 │   │       ├── inex_head.py              ★ 头部（ServoJ part=3，默认关闭）
 │   │       ├── f1_waist.py               腰部升降（→ EC_Line_Control 节点 → /inex/move_to）
 │   │       ├── f1_chassis.py             底盘速度 + SetControlMode（未变）
-│   │       ├── safety_guard.py / safety_worker.py   质心/碰撞安全门（cyb，子进程）
+│   │       ├── safety_guard.py          碰撞/质心安全门（订阅外部检测节点 /f1_safety/is_safe）
 │   │       ├── recording.py              ros2 bag 录制 + 外部相机录制器信号
 │   │       ├── lead_publisher.py         主端数据镜像 /lead/*
 │   │       └── external_pose_input.py    外部位姿回放输入
@@ -97,8 +97,8 @@ python scripts/teleop_f1_hardware.py --help
 * **位置限位 clamp 模式**：lxl 在本 URDF 上实测 Placo 内置位置限位错位（J7 套用了夹爪 prismatic 关节的 [0, 0.04]），
   故默认 `teleop.ik.joint_limit_mode: clamp`（求解后按 q 索引钳位，限位 = URDF ∩ 驱动软限位 − 3°）；
   速度限位不受影响仍交给 QP。换 URDF 后可改回 `qp`。
-* **安全门**：cyb `SafetyProtector` 模型为天机双臂 F1，与珞石臂几何不同，默认 `safety.enable: false`；
-  确认模型适配后再开（lxl 珞石版开着质心保护）。
+* **安全门**：碰撞/质心检测由独立节点 `realtime_joint_safety_monitor.py`（cyb `SafetyProtector`，读 `/inex/joint_states`）完成，
+  发布 `std_msgs/Bool` 到 `/f1_safety/is_safe`；遥操只订阅该结果，False 时双臂冻结在最近安全指令。默认 `safety.enable: false`。
 * **所有魔法数字进 yaml**：话题名、关节名、位姿、iNex 时序参数、规划器参数、阈值、权重、限位。
 
 ## 与 lxl_origin_rokae_v1.1 的对应关系
@@ -111,7 +111,7 @@ python scripts/teleop_f1_hardware.py --help
 | `xrobotoolkit_teleop/common/send2real_robot_f1_udp.py` `angle_map` + `sync_placo_to_real` + 偏差补偿 | `JointMap`（yaml `robot.joint_map`） |
 | `base_teleop_controller_ik_mixin._clamp_arm_joint_limits` | `base_teleop_controller` `joint_limit_mode: clamp` |
 | `base_teleop_controller_ik_mixin._limit_send_delta` | 规划器 vmax/amax（或 `max_joint_speed_deg_s`） |
-| `collision_check_worker.py` | `interface/safety_worker.py` + `safety_guard.py` |
+| `collision_check_worker.py` | 独立节点 `realtime_joint_safety_monitor.py` + `interface/safety_guard.py`（订阅 `/f1_safety/is_safe`） |
 | `ip_config.py`（IP/端口/位姿） | yaml `robot.home_pose/reset_pose`（UDP 已取消） |
 | `start_all_pico2_log.sh` / `stop_all_pico.sh` | `start_teleop.sh` / `stop_teleop.sh` |
 
@@ -120,4 +120,4 @@ python scripts/teleop_f1_hardware.py --help
 ROS2 jazzy（rclpy, sensor_msgs, control_msgs, geometry_msgs, std_msgs），`inex_ros2_interface` **v1.0**
 （含 `ServoCommand` / `RobotSystemStatus` / `TcpPosition`，由 `~/workspace/inex_ros` 工作区提供），
 `move` 接口包（interface_20260623），`xrobotoolkit_sdk`，`placo==0.9.4`，`meshcat`，`numpy`，`pyyaml`，`tyro`；
-安全门需 `cyb_safe_control_real`（路径见 yaml `safety.module_dir`）。
+安全门需先启动 `realtime_joint_safety_monitor.py`（依赖 `cyb_safe_control_real`）发布 `/f1_safety/is_safe`。

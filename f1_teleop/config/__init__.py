@@ -74,7 +74,7 @@ _REQUIRED = (
     "com_guard.warn_max",
     "chassis.move_topic",
     "chassis.control_mode_service",
-    "safety.module_dir",
+    "safety.enable",
     "recording.topics",
 )
 
@@ -104,6 +104,5 @@ def load_config(path: str | None = None) -> SimpleNamespace:
     if not os.path.isabs(bag_dir):
         bag_dir = os.path.join(PROJECT_ROOT, bag_dir)
     cfg.recording.bag_dir = os.path.abspath(bag_dir)
-    cfg.safety.module_dir = os.path.abspath(os.path.expanduser(cfg.safety.module_dir))
     cfg.config_path = path
     return cfg
