@@ -125,9 +125,9 @@ class ComGuard:
             self._gate_open = True                          # 无数据 → fail-safe 保护生效
             return True
         if self._gate_open:
-            if np.any(z < self.tcp_gate - self.tcp_gate_hyst):
+            if np.all(z < self.tcp_gate - self.tcp_gate_hyst):
                 self._gate_open = False
-        elif np.all(z > self.tcp_gate):
+        elif np.any(z > self.tcp_gate):
             self._gate_open = True
         return self._gate_open
 

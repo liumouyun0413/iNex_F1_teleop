@@ -252,7 +252,7 @@ com_guard:
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
-  # 末端高度门：双臂 TCP（/inex/tcp_pose，chassis_link 系）z 都高于此值才执行 WARN/STOP 判定；任一臂低于（减回差）则暂停保护
+  # 末端高度门：任一臂 TCP（/inex/tcp_pose，chassis_link 系）z 高于此值即执行 WARN/STOP 判定；双臂都低于（减回差）则暂停保护
   # （低位搬运时质心本就靠下、翻倒风险小）。null = 不设门、始终保护。已闩锁的 STOP 不受门影响；tcp_pose 超时按门开处理。
   tcp_z_gate_m: 0.80
   tcp_z_gate_hyst_m: 0.02

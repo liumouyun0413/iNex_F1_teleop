@@ -395,7 +395,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 print(f"[CoM] 质心保护已启用：当前 {np.round(p, 3)} m (M={self.com_guard.mass:.1f} kg) | 距 warn/stop 盒 {mw*100:.1f}/{ms*100:.1f} cm")
                 if self.com_guard.tcp_gate is not None:
                     z = self.com_guard.tcp_z
-                    print(f"[CoM] 末端高度门：双臂 TCP z 都 > {self.com_guard.tcp_gate:.2f} m 才执行保护（回差 {self.com_guard.tcp_gate_hyst*100:.0f} cm）；"
+                    print(f"[CoM] 末端高度门：任一臂 TCP z > {self.com_guard.tcp_gate:.2f} m 即执行保护，双臂都低于则暂停（回差 {self.com_guard.tcp_gate_hyst*100:.0f} cm）；"
                           f"当前 左/右 z = {z[0]:.3f}/{z[1]:.3f} m")
                 if ms < 0:
                     raise RuntimeError("[CoM] 启动时质心已在 stop 盒外，请检查姿态/负载或放宽 com_guard 参数")
