@@ -125,8 +125,8 @@ inex:
   #      否则 start_impedance 会因力矩偏差超 30 Nm 被拒（30003）。
   # null = 解绑（驱动在遥操重启间会保留上次绑定，故显式清除）。
   held_object:
-    left:  null                       # 例：{mass: 5.0, com: [0.0, 0.0, 0.20], inertia: [0, 0, 0, 0, 0, 0]}
-    right: null
+    left:  {mass: 5.0, com: [0.0,  0.2, 0.15], inertia: [0, 0, 0, 0, 0, 0]}   # 2026-11-19 双臂夹 10 kg 箱：箱心在两夹爪中间（法兰系 +y=机体右，+z=前），左右各计 5 kg
+    right: {mass: 5.0, com: [0.0, -0.2, 0.15], inertia: [0, 0, 0, 0, 0, 0]}   # 不夹箱时改回 null（否则质心保护被虚假负载带偏）
   # 关节阻抗档下遥操（实验）：READY 热切 JOINT_IMPEDANCE → 设刚度 → start_impedance → ServoJ（2026-11-14 实测驱动接受）。
   # 不标定力矩传感器（calibrate_force 仅允许场景运行）；退出时 stop_impedance_session。驱动默认刚度 [100,100,100,100,50,50,50] Nm/rad。
   impedance:
@@ -134,7 +134,8 @@ inex:
     arms: [left, right]               # left / right
     # 7 个 Nm/rad（J1..J7，左右共用）；null=沿用驱动当前值。驱动默认 [100,100,100,100,50,50,50]。
     # 2026-11-14 ms-thor 调参：100 量级回零重力偏差 3.4°，肩/肘“软”；J1/J2 1000、J3/J4 500 后偏差 0.1°。
-    joint_stiffness: [1000, 1000, 500, 500, 100, 50, 50]
+    # 2026-11-20：J7 曾试 25，持 5 kg 箱静态偏转 3.6° > 驱动“阻抗参考跳变”阈值 0.05 rad，X+Y 复位时左臂会话被杀（50 后正常）；J6 提到 100。
+    joint_stiffness: [1000, 1000, 500, 500, 100, 100, 50]
   # ServoJ 输出规划器（对应 lxl 桥接 send_loop）。天机版只靠末端摆率 + Placo 速度限制就够，
   # 珞石 iNex ServoJ 是位置流，lxl 注释反复强调"防底层报警"，故保留一层加速度/速度兑底：
   #   mode: clamp    = 只在超 vmax/amax 时夹住，不触限时输出恒等于 IK 目标，零附加延迟（默认）
@@ -246,15 +247,15 @@ com_guard:
   # 2026-11-14 实测：双臂向前上方正常伸展（末端 x≈0.75, z≈0.6）质心 x 到 0.02~0.03；前向盒稍放宽 2 cm，
   # stop 前边 0.07 距前轮触地点仍有 5.8 cm（坡度 3° 2.0 + 模型 1.4 + 臂反力 1.2 ≈ 4.6）；WARN/STOP 期间底盘被禁，不计底盘减速。
   stop_min: [-0.25, -0.14, -1.0]
-  stop_max: [ 0.07,  0.14,  1.0]
+  stop_max: [ 0.120,  0.14,  1.0]   # 2026-11-19/20 双臂持 10 kg 箱实测放宽：距前轮触地点 0.128 仅 0.8 cm，平地/底盘禁用前提
   warn_min: [-0.22, -0.11, -1.0]
-  warn_max: [ 0.04,  0.11,  1.0]
+  warn_max: [ 0.075,  0.11,  1.0]
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
   # 末端高度门：任一臂 TCP（/inex/tcp_pose，chassis_link 系）z 高于此值用上面的高位盒；双臂都低于（减回差）切到 low_zone 宽限盒
   # （低位搬运时质心本就靠下、翻倒风险小）。null = 不设门、始终用高位盒。已闩锁的 STOP 不受门影响；tcp_pose 超时按高位盒处理。
-  tcp_z_gate_m: 0.80
+  tcp_z_gate_m: 0.90
   tcp_z_gate_hyst_m: 0.02
   tcp_topic: /inex/tcp_pose
   # 低位宽限盒（门关时生效）；删掉本段 = 门关时不做质心保护。注意抬臂过门瞬间若质心已在高位盒外会立即 WARN/STOP。
@@ -274,11 +275,12 @@ safety:
   # 只开碰撞检测（手臂-机身/双臂互碰，MuJoCo 代理几何，不安全帧冻结双臂到最近安全指令）；
   # 质心保护用 iNex 原生 /inex/com_state（上面 com_guard 段），这里保持关闭。
   # 注意 cyb 配置里 collision_guard.gripper_length 默认 0.002（几乎不建夹爪体），实装夹爪 ≈0.20 m 时建议改为 0.20。
-  enable: true
+  # 2026-11-20 与机器人现场配置同步：当前关闭。需要碰撞保护时改 enable: true + enable_collision_guard: true。
+  enable: false
   enable_com_guard: false          # 质心保护（用 iNex 原生，不用 cyb）
-  enable_collision_guard: true     # 手臂-机身碰撞检测
+  enable_collision_guard: false    # 手臂-机身碰撞检测
   module_dir: /home/user/cyb_safe_control_real/cyb_dist/src/python
-  check_rate_hz: 30.0
+  check_rate_hz: 15.0
   warn_interval_sec: 3.0
   body_joint_order_reversed: true  # lxl 珞石版（2026-10-16）确认 SafetyProtector 腰段为 j5..j1 反序
 
