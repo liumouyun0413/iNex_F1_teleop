@@ -8,6 +8,8 @@ ComGuard —— 基于 iNex 原生整机质心 /inex/com_state 的倾倒保护�
   * stop 盒（外层）：越出 → 平滑制动，需人工复位
 数据无效或超时（> timeout_ms 无 valid 帧）按 STOP 处理（fail-safe，与厂商 servoj_mass_guard 一致）。
 只用 position；velocity 字段实测为数值噪声（静止时 σ≈20 m/s），不参与判断。
+可选末端高度门（tcp_z_gate_m）：只有双臂 TCP（/inex/tcp_pose，chassis_link 系）z 都高于阈值才执行 WARN/STOP 判定；
+任一臂低于阈值（低位搬运、质心本就靠下）时不干预。已闩锁的 STOP 不受门影响。tcp_pose 超时按门开（保护生效）处理。
 """
 
 from __future__ import annotations
@@ -22,9 +24,9 @@ from rclpy.qos import qos_profile_sensor_data
 from f1_teleop.hardware.interface.ros_context import RosContext
 
 try:
-    from inex_ros2_interface.msg import ComState
+    from inex_ros2_interface.msg import ComState, TcpPosition
 except ImportError as e:  # pragma: no cover
-    raise ImportError("无法导入 inex_ros2_interface.msg.ComState：请先 source iNex 工作区") from e
+    raise ImportError("无法导入 inex_ros2_interface.msg.ComState/TcpPosition：请先 source iNex 工作区") from e
 
 STATE_OK = "OK"
 STATE_WARN = "WARN"
@@ -44,6 +46,9 @@ class ComGuard:
         hysteresis_m: float = 0.01,
         hold_warn_sec: float = 0.3,
         stop_confirm_frames: int = 3,
+        tcp_z_gate_m: Optional[float] = None,
+        tcp_z_gate_hyst_m: float = 0.02,
+        tcp_topic: str = "/inex/tcp_pose",
     ) -> None:
         self.stop_min = np.asarray(stop_min, dtype=float)
         self.stop_max = np.asarray(stop_max, dtype=float)
@@ -69,6 +74,14 @@ class ComGuard:
         self._latched_stop = False
         ros.node.create_subscription(ComState, topic, self._on_msg, qos_profile_sensor_data)
 
+        self.tcp_gate = None if tcp_z_gate_m is None else float(tcp_z_gate_m)
+        self.tcp_gate_hyst = max(0.0, float(tcp_z_gate_hyst_m))
+        self._tcp_z: Optional[np.ndarray] = None          # [左 z, 右 z]
+        self._t_tcp = 0.0
+        self._gate_open = True                              # 门开 = 保护生效
+        if self.tcp_gate is not None:
+            ros.node.create_subscription(TcpPosition, tcp_topic, self._on_tcp, qos_profile_sensor_data)
+
     # ------------------------------------------------------------------ #
     def _on_msg(self, msg: ComState) -> None:
         with self._lock:
@@ -78,14 +91,45 @@ class ComGuard:
                 self._mass = float(msg.mass)
                 self._t_last_valid = time.monotonic()
 
+    def _on_tcp(self, msg: TcpPosition) -> None:
+        with self._lock:
+            self._tcp_z = np.array([msg.left_arm.position.z, msg.right_arm.position.z])
+            self._t_tcp = time.monotonic()
+
     def wait_for_data(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
-                if self._pos is not None:
+                if self._pos is not None and (self.tcp_gate is None or self._tcp_z is not None):
                     return True
             time.sleep(0.05)
         return False
+
+    @property
+    def tcp_z(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return None if self._tcp_z is None else self._tcp_z.copy()
+
+    @property
+    def gate_open(self) -> bool:
+        """末端高度门是否打开（保护生效）。未配置门时恒为 True。"""
+        return self._gate_open
+
+    def _update_gate(self, now: float) -> bool:
+        if self.tcp_gate is None:
+            return True
+        with self._lock:
+            z = self._tcp_z
+            age = now - self._t_tcp
+        if z is None or age > self.timeout:
+            self._gate_open = True                          # 无数据 → fail-safe 保护生效
+            return True
+        if self._gate_open:
+            if np.any(z < self.tcp_gate - self.tcp_gate_hyst):
+                self._gate_open = False
+        elif np.all(z > self.tcp_gate):
+            self._gate_open = True
+        return self._gate_open
 
     def arm(self) -> None:
         """启用超时判据（在确认已收到首帧之后调用，避免启动阶段误报）。"""
@@ -155,6 +199,10 @@ class ComGuard:
             stale = self._armed and (p is None or age > self.timeout)
         if self._latched_stop:
             return STATE_STOP
+        if not self._update_gate(now):
+            self._state = STATE_OK                          # 门关：不判 WARN/STOP，也不计超时
+            self._stop_viol = 0
+            return STATE_OK
         if stale:
             self.last_stop_reason = f"/inex/com_state 超时：{'未收到有效帧' if p is None else f'{age*1000:.0f} ms 无有效帧'}（累计收到 {n_msgs} 帧）"
             self._latched_stop = True

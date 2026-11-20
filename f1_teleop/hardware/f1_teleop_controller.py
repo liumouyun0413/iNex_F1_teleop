@@ -147,6 +147,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.safety: Optional[SafetyGuard] = None
         self.com_guard: Optional[ComGuard] = None
         self._com_state = "OK"
+        self._com_gate_open = True
         self._com_last_print = 0.0
         self._sw_hist: list = []          # ServoJ 执行看门狗：(t, cmd14, fb14)
         self._sw_last_check = 0.0
@@ -380,6 +381,9 @@ class F1RokaeTeleopController(HardwareTeleopController):
             self.com_guard = ComGuard(
                 self.ros, cg.topic, cg.stop_min, cg.stop_max, cg.warn_min, cg.warn_max,
                 timeout_ms=cg.timeout_ms, hysteresis_m=cg.hysteresis_m, hold_warn_sec=cg.hold_warn_sec,
+                tcp_z_gate_m=getattr(cg, "tcp_z_gate_m", None),
+                tcp_z_gate_hyst_m=getattr(cg, "tcp_z_gate_hyst_m", 0.02),
+                tcp_topic=getattr(cg, "tcp_topic", "/inex/tcp_pose"),
             )
             self._warn_lock_m = float(getattr(cg, "lock_margin_m", self._warn_lock_m))
             gap = float(np.min(np.minimum(self.com_guard.warn_min - self.com_guard.stop_min,
@@ -389,11 +393,16 @@ class F1RokaeTeleopController(HardwareTeleopController):
             if self.com_guard.wait_for_data(5.0):
                 p = self.com_guard.position; mw, ms = self.com_guard.margin()
                 print(f"[CoM] 质心保护已启用：当前 {np.round(p, 3)} m (M={self.com_guard.mass:.1f} kg) | 距 warn/stop 盒 {mw*100:.1f}/{ms*100:.1f} cm")
+                if self.com_guard.tcp_gate is not None:
+                    z = self.com_guard.tcp_z
+                    print(f"[CoM] 末端高度门：双臂 TCP z 都 > {self.com_guard.tcp_gate:.2f} m 才执行保护（回差 {self.com_guard.tcp_gate_hyst*100:.0f} cm）；"
+                          f"当前 左/右 z = {z[0]:.3f}/{z[1]:.3f} m")
                 if ms < 0:
                     raise RuntimeError("[CoM] 启动时质心已在 stop 盒外，请检查姿态/负载或放宽 com_guard 参数")
                 self.com_guard.arm()
             else:
-                raise RuntimeError(f"[CoM] 未收到 {cg.topic}，com_guard.enable=true 时不允许无保护运行")
+                need = cg.topic + (f" / {getattr(cg, 'tcp_topic', '/inex/tcp_pose')}" if self.com_guard.tcp_gate is not None else "")
+                raise RuntimeError(f"[CoM] 未收到 {need}，com_guard.enable=true 时不允许无保护运行")
         else:
             print("[CoM] 质心保护未启用")
         if cfg.safety.enable:
@@ -631,6 +640,12 @@ class F1RokaeTeleopController(HardwareTeleopController):
             return "OK"
         new = self.com_guard.evaluate()
         now = time.monotonic()
+        gate = self.com_guard.gate_open
+        if gate != self._com_gate_open:
+            z = self.com_guard.tcp_z
+            zs = "?" if z is None else f"{z[0]:.2f}/{z[1]:.2f}"
+            print(f"[CoM] 末端高度门{'打开，质心保护生效' if gate else '关闭，质心保护暂停'}（左/右 TCP z = {zs} m，阈值 {self.com_guard.tcp_gate:.2f}）")
+            self._com_gate_open = gate
         if new != self._com_state or (new != "OK" and now - self._com_last_print > 2.0):
             p = self.com_guard.position; mw, ms = self.com_guard.margin()
             tag = {"OK": "✅", "WARN": "⚠️", "STOP": "❌"}[new]
