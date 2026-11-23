@@ -4,11 +4,10 @@ SafetyGuard —— 碰撞 / 质心安全门（订阅外部检测节点的结果�
 检测本身由独立节点（realtime_joint_safety_monitor.py，持有 cyb SafetyProtector，读 /inex/joint_states）完成，
 并以 std_msgs/Bool 发布到 /f1_safety/is_safe；本类只订阅该结果，不再在遥操进程内/子进程中跑 SafetyProtector。
 
-工作方式（与旧版一致）：
-  * 控制线程每拍调用 filter(arm_cmd_deg)：
-      - is_safe=True  → 原样放行，并把该指令记为"最近安全指令"；
-      - is_safe=False → 冻结：用最近安全指令替代目标（双臂一起冻结，碰撞/质心无法归因到单臂）。
-  * 结果超时（> stale_timeout_sec 未更新）视为检测节点异常：打印告警并放行（与旧版"检查异常，暂时放行"一致）。
+工作方式：
+  * 控制线程每拍调用 check(arm_cmd_deg)：返回当前是否安全；安全时把该指令记为“最近安全指令”（last_safe）。
+    不安全时的处理（刹停 + 回写 Placo + 重锚手柄，只放行向 last_safe 回撤的目标）在控制器里，与 CoM WARN 一致。
+  * 结果超时（> stale_timeout_sec 未更新）视为检测节点异常：打印告警并按安全处理（与旧版“检查异常，暂时放行”一致）。
   * 启动时等待首帧，等不到则抛错（safety.enable=true 时不允许无保护运行）。
 """
 
@@ -50,7 +49,6 @@ class SafetyGuard:
         self._last_safe: Optional[np.ndarray] = np.asarray(initial_cmd_deg, dtype=float)[:14].copy()
         self.frozen = False
         self.reject_count = 0
-        self._last_warn = 0.0
         self._last_stale_warn = 0.0
 
         ros.node.create_subscription(Bool, topic, self._on_msg, qos_profile_sensor_data)
@@ -72,27 +70,27 @@ class SafetyGuard:
             self._n_msgs += 1
 
     # ------------------------------------------------------------------ #
-    def filter(self, arm_cmd_deg: Sequence[float]) -> np.ndarray:
-        """返回实际应下发的双臂指令：不安全时为最近安全指令，否则原样放行。"""
-        raw = np.asarray(arm_cmd_deg, dtype=float)
+    def check(self, arm_cmd_deg: Sequence[float]) -> bool:
+        """当前是否安全；安全时把 arm_cmd_deg 记为最近安全指令。"""
         now = time.monotonic()
         with self._lock:
             is_safe, age = self._is_safe, now - self._t_msg
             if age > self.stale_timeout:
-                is_safe = True                                  # 检测节点断流：放行并告警
+                is_safe = True                                  # 检测节点断流：按安全处理并告警
                 if now - self._last_stale_warn >= self.warn_interval_sec:
                     self._last_stale_warn = now
                     print(f"[Safety] ⚠️ {self.topic} 已 {age:.1f}s 未更新（检测节点异常？），暂时放行")
             self.frozen = not is_safe
             if is_safe:
-                self._last_safe = raw.copy()
-                return raw
-            out = self._last_safe.copy() if self._last_safe is not None else raw
-        self.reject_count += 1
-        if now - self._last_warn >= self.warn_interval_sec:
-            self._last_warn = now
-            print("[Safety] 危险（碰撞或质心越界），双臂冻结在最近安全指令")
-        return out
+                self._last_safe = np.asarray(arm_cmd_deg, dtype=float)[:14].copy()
+            else:
+                self.reject_count += 1
+        return is_safe
+
+    @property
+    def last_safe(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return None if self._last_safe is None else self._last_safe.copy()
 
     def reset_last_safe(self, arm_cmd_deg: Sequence[float]) -> None:
         """复位/同步后重置安全回退点，避免解冻时跳回旧位置。"""
