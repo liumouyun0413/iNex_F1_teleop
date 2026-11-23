@@ -85,7 +85,6 @@ def build_manipulator_config(cfg: SimpleNamespace) -> Dict[str, dict]:
 
 class F1RokaeTeleopController(HardwareTeleopController):
     WARN_HAND_EPS_M = 3e-4        # 手柄每帧位移 ±0.3 mm（3 cm/s）以内视为中性（静止/横移/抖动）
-    SAFETY_RETREAT_TOL_DEG = 0.1  # 碰撞冻结中：候选构型到最近安全构型的关节距离比当前指令多出超过此值即视为“更深入”，拒绝
 
     def __init__(self, cfg: SimpleNamespace, visualize_placo: bool = False) -> None:
         self.cfg = cfg
@@ -157,8 +156,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._xr_frozen = False
         self._warn_ref: Optional[np.ndarray] = None   # WARN：驱动质心 - 模型质心 的 xy 偏置（m），冻结时标定
         self._warn_lock_m = 0.002                     # WARN 中允许预测质心越出 warn 盒的深度（配置 com_guard.lock_margin_m）
-        self._safety_hold = False                     # 碰撞检测不安全 → 已刹停并重锚
-        self._safety_last_print = 0.0
 
     # ------------------------------------------------------------------ #
     # 关节映射 / 限位辅助
@@ -272,7 +269,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self.sync_arm_joints(self._deg14_to_placo(arm_deg))
         if self.safety:
             self.safety.reset_last_safe(arm_deg)
-            self._safety_hold = False
         if self.arm:
             self.arm.anchor_planner(arm_deg)
 
@@ -710,37 +706,6 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._hold_and_revert()
         self._warn_ref = self._com_bias_xy()
 
-    def _safety_step(self, ik_deg: np.ndarray) -> None:
-        """碰撞检测（/f1_safety/is_safe=False）期间：与 CoM WARN 同样的“刹停 + 回写 Placo + 重锚手柄”，然后按从头开始的增量遥操继续。
-
-        检测节点判的是反馈构型：臂停在碌撞边缘时 is_safe 会一直为 False，若只是冻结就死锁（旧版需 X+Y）。因此冻结后只放行
-        “不更深入”的目标：每只臂候选构型到最近安全指令（碰撞前最后一帧）的关节距离不得比当前指令大（容差 SAFETY_RETREAT_TOL_DEG），
-        即允许回撤/原地，拒绝继续前推（拒绝 = hold + 回写 + 重锚，前推量被吃掉）。反馈退出碌撞区后 is_safe 恢复，无跳变继续。"""
-        if self.arm.last_cmd_deg is None:
-            self.arm.publish_hold_cmd(self.dt)
-            return
-        now = time.monotonic()
-        if not self._safety_hold:
-            self._safety_hold = True
-            self._safety_last_print = now
-            self._hold_and_revert()
-            print("[Safety] ❌ 碰撞检测不安全：双臂刹停并重锚手柄；只放行向碰撞前构型回撤的动作，反馈离开碌撞区后自动恢复")
-            return
-        anchor = self.safety.last_safe
-        cur = self.arm.last_cmd_deg
-        accept = anchor is not None and all(
-            np.linalg.norm(ik_deg[sl] - anchor[sl]) <= np.linalg.norm(cur[sl] - anchor[sl]) + self.SAFETY_RETREAT_TOL_DEG
-            for sl in (slice(0, 7), slice(7, 14)))
-        if accept:
-            self.arm.publish_planned_cmd(ik_deg, self.dt)
-            self._publish_ik_target(ik_deg)
-        else:
-            self._hold_and_revert()
-        if now - self._safety_last_print >= self.safety.warn_interval_sec:
-            self._safety_last_print = now
-            d = "?" if anchor is None else f"{np.linalg.norm(cur[:7]-anchor[:7]):.1f}/{np.linalg.norm(cur[7:]-anchor[7:]):.1f}"
-            print(f"[Safety] 仍不安全：当前指令距碰撞前构型 L/R {d}°，请向回撤方向移动手柄（或 X+Y 复位）")
-
     def _placo_com_xy(self) -> np.ndarray:
         with self._placo_lock:
             self.placo_robot.update_kinematics()      # solver.solve(True) 只写 q，不刷新运动学
@@ -790,13 +755,8 @@ class F1RokaeTeleopController(HardwareTeleopController):
             elif self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
                 arm_deg = self._placo_to_deg14()
-                if self.safety and not self.safety.check(arm_deg):
-                    self._safety_step(arm_deg)
-                    self.chassis.publish()
-                    return
-                if self._safety_hold:
-                    self._safety_hold = False
-                    print("[Safety] ✅ 碰撞检测恢复安全，从当前构型继续遥操")
+                if self.safety:
+                    arm_deg = self.safety.filter(arm_deg)
                 if self.arm.planner is None:
                     arm_deg = self._limit_step(arm_deg)
                 self.arm.publish_planned_cmd(arm_deg, self.dt)
