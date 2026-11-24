@@ -18,9 +18,9 @@ find "${LOG_DIR}" -maxdepth 1 -name '*.log' -mtime +7 -delete 2>/dev/null   # �
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
 # iNex 工作区（inex_ros2_interface v1.0：ServoCommand / RobotSystemStatus 等）—— 必需
 INEX_SETUP="${INEX_SETUP:-${HOME}/workspace/inex_ros/install/setup.bash}"
-# interface_20260623 编译产物（底盘 move/srv）：优先用机器人上已编译的，其次用本目录自带的
+# interface_20260623 编译产物（底盘 move/srv）：本目录自带；可用 IFACE_SETUP=... 指定其它位置
 IFACE_SETUP_CANDIDATES=(
-    "${HOME}/lxl/interface_20260623/install/setup.bash"
+    "${IFACE_SETUP:-}"
     "${SCRIPT_DIR}/interface_20260623/install/setup.bash"
 )
 CONDA_BASE="${HOME}/miniconda3"
@@ -92,21 +92,21 @@ unset IFS
 INEX_IFACE_LIB="$(dirname "${INEX_SETUP}")/inex_ros2_interface/lib"
 export LD_LIBRARY_PATH="/opt/ros/jazzy/lib:${INEX_IFACE_LIB}:${_clean_ldp}"
 
-# PICO SDK 原生库：xrobotoolkit_sdk 的 RUNPATH 指向编译机上的 XRoboToolkit-PC-Service-Pybind/lib/<arch>，
-# 换机器后失效（ImportError: libPXREARobotSDK.so）。RoboticsService 安装包自带同一库，找到就加进搜索路径。
+# PICO SDK 原生库：xrobotoolkit_sdk 的 RUNPATH 指向编译机路径，换机器后失效（ImportError: libPXREARobotSDK.so）；
+# 统一用 RoboticsService 安装包自带的同一库（SDK/<arch>/）。
 PXREA_FOUND=0
-for _d in "${ROBOTICS_SERVICE_DIR}"/SDK/*/ "${HOME}"/lxl/XRoboToolkit-Teleop-Sample-Python/dependencies/XRoboToolkit-PC-Service-Pybind/lib/*/; do
+for _d in "${ROBOTICS_SERVICE_DIR}"/SDK/*/; do
     if [[ -f "${_d}libPXREARobotSDK.so" ]]; then
         export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${_d%/}"; PXREA_FOUND=1; break
     fi
 done
-[[ "${PXREA_FOUND}" == "1" ]] || echo "⚠️ 未找到 libPXREARobotSDK.so（RoboticsService 未安装？），xrobotoolkit_sdk 可能无法导入"
+[[ "${PXREA_FOUND}" == "1" ]] || echo "⚠️ 未找到 ${ROBOTICS_SERVICE_DIR}/SDK/*/libPXREARobotSDK.so（RoboticsService 未安装？），xrobotoolkit_sdk 可能无法导入"
 
 if pgrep -f teleop_f1_hardware.py >/dev/null; then
     echo "❌ teleop_f1_hardware.py 已在运行，请先 ./stop_teleop.sh"; exit 1
 fi
 if pgrep -f "teleop_lxl.py|all_remote_lxl.py" >/dev/null; then
-    echo "❌ 旧版 lxl 遥操进程仍在运行，会与本程序争抢 /inex/servo_cmd，请先 ~/lxl/stop_all_pico.sh"; exit 1
+    echo "❌ 旧版 lxl 遥操进程仍在运行，会与本程序争抢 /inex/servo_cmd，请先停掉"; exit 1
 fi
 
 cd "${SCRIPT_DIR}"
