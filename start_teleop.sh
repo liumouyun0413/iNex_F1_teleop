@@ -92,6 +92,16 @@ unset IFS
 INEX_IFACE_LIB="$(dirname "${INEX_SETUP}")/inex_ros2_interface/lib"
 export LD_LIBRARY_PATH="/opt/ros/jazzy/lib:${INEX_IFACE_LIB}:${_clean_ldp}"
 
+# PICO SDK 原生库：xrobotoolkit_sdk 的 RUNPATH 指向编译机上的 XRoboToolkit-PC-Service-Pybind/lib/<arch>，
+# 换机器后失效（ImportError: libPXREARobotSDK.so）。RoboticsService 安装包自带同一库，找到就加进搜索路径。
+PXREA_FOUND=0
+for _d in "${ROBOTICS_SERVICE_DIR}"/SDK/*/ "${HOME}"/lxl/XRoboToolkit-Teleop-Sample-Python/dependencies/XRoboToolkit-PC-Service-Pybind/lib/*/; do
+    if [[ -f "${_d}libPXREARobotSDK.so" ]]; then
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${_d%/}"; PXREA_FOUND=1; break
+    fi
+done
+[[ "${PXREA_FOUND}" == "1" ]] || echo "⚠️ 未找到 libPXREARobotSDK.so（RoboticsService 未安装？），xrobotoolkit_sdk 可能无法导入"
+
 if pgrep -f teleop_f1_hardware.py >/dev/null; then
     echo "❌ teleop_f1_hardware.py 已在运行，请先 ./stop_teleop.sh"; exit 1
 fi
