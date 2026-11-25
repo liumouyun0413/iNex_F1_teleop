@@ -27,7 +27,9 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+# 加密发布版 f1_teleop_dist/（pyarmor）存在时优先用它，否则用源码包 f1_teleop/
+sys.path.insert(0, os.path.join(_ROOT, "f1_teleop_dist") if os.path.isdir(os.path.join(_ROOT, "f1_teleop_dist")) else _ROOT)
 
 import numpy as np  # noqa: E402
 import placo  # noqa: E402
