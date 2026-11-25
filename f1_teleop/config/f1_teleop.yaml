@@ -250,13 +250,13 @@ com_guard:
   stop_min: [-0.25, -0.14, -1.0]
   stop_max: [ 0.120,  0.14,  1.0]   # 2026-11-19/20 双臂持 10 kg 箱实测放宽：距前轮触地点 0.128 仅 0.8 cm，平地/底盘禁用前提
   warn_min: [-0.22, -0.11, -1.0]
-  warn_max: [ 0.030,  0.11,  1.0]
+  warn_max: [ 0.042,  0.11,  1.0]   # 2026-11-25 机器人现场值
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
   # 末端高度门：任一臂 TCP（/inex/tcp_pose，chassis_link 系）z 高于此值用上面的高位盒；双臂都低于（减回差）切到 low_zone 宽限盒
   # （低位搬运时质心本就靠下、翻倒风险小）。null = 不设门、始终用高位盒。已闩锁的 STOP 不受门影响；tcp_pose 超时按高位盒处理。
-  tcp_z_gate_m: 0.90
+  tcp_z_gate_m: 1.30   # 2026-11-25 机器人现场值
   tcp_z_gate_hyst_m: 0.02
   tcp_topic: /inex/tcp_pose
   # 低位宽限盒（门关时生效）；删掉本段 = 门关时不做质心保护。注意抬臂过门瞬间若质心已在高位盒外会立即 WARN/STOP。
