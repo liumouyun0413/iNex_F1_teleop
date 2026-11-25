@@ -18,9 +18,10 @@ find "${LOG_DIR}" -maxdepth 1 -name '*.log' -mtime +7 -delete 2>/dev/null   # �
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
 # iNex 工作区（inex_ros2_interface v1.0：ServoCommand / RobotSystemStatus 等）—— 必需
 INEX_SETUP="${INEX_SETUP:-${HOME}/workspace/inex_ros/install/setup.bash}"
-# interface_20260623 编译产物（底盘 move/srv）：本目录自带；可用 IFACE_SETUP=... 指定其它位置
+# interface_20260623 编译产物（底盘 move/srv）：IFACE_SETUP=... 指定 > ~/interface_20260623 > 本目录自带
 IFACE_SETUP_CANDIDATES=(
     "${IFACE_SETUP:-}"
+    "${HOME}/interface_20260623/install/setup.bash"
     "${SCRIPT_DIR}/interface_20260623/install/setup.bash"
 )
 CONDA_BASE="${HOME}/miniconda3"
