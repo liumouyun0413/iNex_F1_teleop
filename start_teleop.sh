@@ -3,7 +3,8 @@
 # F1（珞石双臂 + iNex ROS2）遥操作一键启动（替代 lxl 珞石版的 start_all_pico2_log.sh）
 #   1) 腰部升降节点（EC_Line_Control，可选）
 #   2) PICO 数据服务 RoboticsService
-#   3) 遥操作主程序 teleop_f1_hardware.py（单进程：iNex 双臂/夹爪/头/腰/底盘/安全门/数采）
+#   3) 碰撞检测节点 realtime_joint_safety_monitor.py（cyb，发布 /f1_safety/is_safe；可选）
+#   4) 遥操作主程序 teleop_f1_hardware.py（单进程：iNex 双臂/夹爪/头/腰/底盘/安全门/数采）
 # 日志按时间戳写入 ./log/，重启不覆盖。
 # 注意：不要开 set -u，ROS/conda 的 setup 脚本会引用未定义变量。
 # ============================================================================
@@ -28,6 +29,9 @@ CONDA_BASE="${HOME}/miniconda3"
 CONDA_ENV="pico4ultra_py312"
 ROBOTICS_SERVICE_DIR="/opt/apps/roboticsservice"
 START_WAIST_NODE="${START_WAIST_NODE:-1}"   # 腰部节点（EC_Line_Control/waist_updown_ros2.py → /inex/move_to）
+START_SAFETY_MONITOR="${START_SAFETY_MONITOR:-1}"   # 碰撞检测节点（yaml safety.enable=true 时遥操启动必须收到 /f1_safety/is_safe）
+CYB_DIR="${CYB_DIR:-${HOME}/cyb_safe_control_real/cyb_dist/src/python}"   # cyb SafetyProtector + realtime_joint_safety_monitor.py 所在目录
+SAFETY_MONITOR_ARGS="${SAFETY_MONITOR_ARGS:-}"   # 例如 "--check-hz 500"
 TELEOP_ARGS="${TELEOP_ARGS:-}"              # 例如 TELEOP_ARGS="--visualize-placo"
 # --------------------------------------------------
 
@@ -74,7 +78,28 @@ else
     echo "⚠️ 未找到 ${ROBOTICS_SERVICE_DIR}"
 fi
 
-# 3) 遥操作主程序（conda 环境）
+# 3) 碰撞检测节点（系统 python3 + ROS 环境，须在 conda 激活前启动）
+SAFETY_MONITOR="${CYB_DIR}/realtime_joint_safety_monitor.py"
+if [[ "${START_SAFETY_MONITOR}" == "1" ]]; then
+    if pgrep -f "realtime_joint_safety_monitor.py" >/dev/null; then
+        echo "碰撞检测节点已在运行"
+    elif [[ -f "${SAFETY_MONITOR}" ]]; then
+        SM_LOG="${LOG_DIR}/safety_monitor_${TS}.log"
+        (cd "${CYB_DIR}" && RCUTILS_LOGGING_MAX_SEVERITY=40 nohup /usr/bin/python3 "${SAFETY_MONITOR}" ${SAFETY_MONITOR_ARGS} > "${SM_LOG}" 2>&1 < /dev/null &)
+        for _ in $(seq 1 30); do grep -q "\[Safety\] 等待" "${SM_LOG}" 2>/dev/null && break; sleep 0.5; done   # MuJoCo 模型加载数秒
+        if pgrep -f "realtime_joint_safety_monitor.py" >/dev/null; then
+            echo "碰撞检测节点已启动，日志 ${SM_LOG}"
+        else
+            echo "⚠️ 碰撞检测节点启动失败（见 ${SM_LOG}）；yaml safety.enable=true 时遥操会因收不到 /f1_safety/is_safe 终止"
+        fi
+    else
+        echo "⚠️ 未找到 ${SAFETY_MONITOR}（可用 CYB_DIR=... 指定），跳过碰撞检测节点"
+    fi
+elif ! pgrep -f "realtime_joint_safety_monitor.py" >/dev/null; then
+    echo "⚠️ 未检测到碰撞检测节点，yaml safety.enable=true 时遥操无法启动"
+fi
+
+# 4) 遥操作主程序（conda 环境）
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}" || { echo "❌ conda 环境 ${CONDA_ENV} 激活失败"; exit 1; }
 
@@ -117,7 +142,7 @@ sleep 2
 
 echo ""
 echo "进程检查："
-ps aux | grep -E 'teleop_f1_hardware|runService|RoboticsServiceProcess|waist_updown_ros2' | grep -v grep
+ps aux | grep -E 'teleop_f1_hardware|realtime_joint_safety_monitor|runService|RoboticsServiceProcess|waist_updown_ros2' | grep -v grep | cut -c1-160
 echo ""
 echo "日志：tail -f ${LOG_DIR}/teleop_${TS}.log"
 echo "停止：./stop_teleop.sh"
