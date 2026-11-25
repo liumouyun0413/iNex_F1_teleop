@@ -170,6 +170,9 @@ inex:
 teleop:
   control_rate_hz: 100       # IK 与下发线程频率（ServoJ 10~1000Hz 均可）
   scale_factor: 1.5          # 手柄位移 → 末端位移放大倍数
+  # 限速系数 (0,1]：规划器 vmax/amax、ik.joint_velocity_limits、max_ee_speed/ang_speed、max_joint_speed 统一乘以该值。
+  # 1.0 = 正常版；0.5 = 限速版（手动快时臂滞后追赶、不少走行程）。CLI --speed-scale 可覆盖。
+  speed_scale: 1.0
   grip_activate_threshold: 0.9   # 握把 > 该值视为激活该臂
   ik:
     frame_task_weight: 10.0
