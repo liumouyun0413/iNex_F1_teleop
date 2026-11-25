@@ -24,3 +24,6 @@ EC_Line_Control/__pycache__/
 EC_Line_Control/* copy.*
 EC_Line_Control/* copy *
 EC_Line_Control/dist/
+
+# pyarmor 加密产物（pyarmor gen -O common_dist -r -i common）
+f1_teleop/common_dist/
