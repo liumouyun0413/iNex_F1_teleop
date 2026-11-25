@@ -105,40 +105,4 @@ def load_config(path: str | None = None) -> SimpleNamespace:
         bag_dir = os.path.join(PROJECT_ROOT, bag_dir)
     cfg.recording.bag_dir = os.path.abspath(bag_dir)
     cfg.config_path = path
-    apply_speed_scale(cfg, float(getattr(cfg.teleop, "speed_scale", 1.0) or 1.0))
     return cfg
-
-
-def _scaled(v: Any, s: float) -> Any:
-    if v is None:
-        return None
-    if isinstance(v, list):
-        return [float(x) * s for x in v]
-    return float(v) * s
-
-
-def apply_speed_scale(cfg: SimpleNamespace, scale: float) -> None:
-    """把所有“机器人能跑多快”的上限统一乘以 scale（<1 限速）：规划器 vmax/amax、IK QP 关节速度、末端摆率、无规划器时的每拍步长。
-
-    可重复调用（按 cfg._speed_scale_applied 记录的累计值换算），CLI --speed-scale 覆盖 yaml 的 teleop.speed_scale。
-    手柄→末端的 scale_factor 不动：限的是速度不是行程，手动快了臂会滞后追赶而不是少走。"""
-    scale = float(scale)
-    if scale <= 0.0 or scale > 1.0:
-        raise ConfigError(f"speed_scale 应在 (0, 1]，得到 {scale}")
-    prev = float(getattr(cfg, "_speed_scale_applied", 1.0))
-    s = scale / prev
-    if abs(s - 1.0) < 1e-12:
-        return
-    pl, t, ik = cfg.inex.servo_planner, cfg.teleop, cfg.teleop.ik
-    pl.vmax_deg_s = _scaled(pl.vmax_deg_s, s)
-    pl.amax_deg_s2 = _scaled(pl.amax_deg_s2, s)
-    if getattr(ik, "joint_velocity_limits_deg_s", None) is not None:
-        ik.joint_velocity_limits_deg_s = _scaled(ik.joint_velocity_limits_deg_s, s)
-    if getattr(t, "max_ee_speed_m_s", None) is not None:
-        t.max_ee_speed_m_s = _scaled(t.max_ee_speed_m_s, s)
-    if getattr(t, "max_ee_ang_speed_rad_s", None) is not None:
-        t.max_ee_ang_speed_rad_s = _scaled(t.max_ee_ang_speed_rad_s, s)
-    if getattr(t, "max_joint_speed_deg_s", None) is not None:
-        t.max_joint_speed_deg_s = _scaled(t.max_joint_speed_deg_s, s)
-    cfg._speed_scale_applied = scale
-    cfg.teleop.speed_scale = scale

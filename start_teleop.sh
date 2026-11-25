@@ -29,7 +29,6 @@ CONDA_ENV="pico4ultra_py312"
 ROBOTICS_SERVICE_DIR="/opt/apps/roboticsservice"
 START_WAIST_NODE="${START_WAIST_NODE:-1}"   # 腰部节点（EC_Line_Control/waist_updown_ros2.py → /inex/move_to）
 TELEOP_ARGS="${TELEOP_ARGS:-}"              # 例如 TELEOP_ARGS="--visualize-placo"
-SPEED_SCALE="${SPEED_SCALE:-}"              # 限速版：SPEED_SCALE=0.5 ./start_teleop.sh（等价 --speed-scale 0.5）
 # --------------------------------------------------
 
 echo "=== F1-Rokae teleop 启动 (${TS}) ==="
@@ -112,7 +111,6 @@ if pgrep -f "teleop_lxl.py|all_remote_lxl.py" >/dev/null; then
 fi
 
 cd "${SCRIPT_DIR}"
-[[ -n "${SPEED_SCALE}" ]] && TELEOP_ARGS="${TELEOP_ARGS} --speed-scale ${SPEED_SCALE}" && echo "⚠️ 限速版 speed_scale=${SPEED_SCALE}"
 nohup python -u scripts/teleop_f1_hardware.py ${TELEOP_ARGS} > "${LOG_DIR}/teleop_${TS}.log" 2>&1 &
 echo $! > "${LOG_DIR}/teleop.pid"
 sleep 2
