@@ -250,7 +250,7 @@ com_guard:
   stop_min: [-0.25, -0.14, -1.0]
   stop_max: [ 0.120,  0.14,  1.0]   # 2026-11-19/20 双臂持 10 kg 箱实测放宽：距前轮触地点 0.128 仅 0.8 cm，平地/底盘禁用前提
   warn_min: [-0.22, -0.11, -1.0]
-  warn_max: [ 0.042,  0.11,  1.0]   # 2026-11-25 机器人现场值
+  warn_max: [ 0.030,  0.11,  1.0]   # 2026-11-25 现场收紧（原 0.042）
   timeout_ms: 200        # 无 valid 帧超过此时长 → STOP（fail-safe，与厂商 servoj_mass_guard 一致）
   hysteresis_m: 0.01     # 退出 WARN 需回到 warn 盒再内缩 1 cm
   hold_warn_sec: 0.3     # …且停留 0.3 s
