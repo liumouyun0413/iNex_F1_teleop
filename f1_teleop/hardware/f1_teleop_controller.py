@@ -151,6 +151,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._com_last_print = 0.0
         self._sw_hist: list = []          # ServoJ 执行看门狗：(t, cmd14, fb14)
         self._sw_last_check = 0.0
+        self._sw_trip: Optional[tuple] = None   # 辅助线程判定触发 → (cmd_move, fb_move)，由下发线程执行恢复
         self._xr_last_ts = -1
         self._xr_last_change = time.monotonic()
         self._xr_frozen = False
@@ -742,35 +743,53 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 self.placo_robot.state.q[self.arm_q_slice[name]] = qi
             self.placo_robot.update_kinematics()
 
+    def _lap(self, name: str, t0: float) -> float:
+        """F1_PROFILE=1 时把 _send_command 的分段耗时（ms）记入 control_thread.csv 的 extra 列。"""
+        if not self.prof_ctrl.enabled:
+            return 0.0
+        now = time.perf_counter()
+        self.prof_ctrl.note("t_" + name, f"{(now - t0) * 1e3:.2f}")
+        return now
+
     def _send_command(self) -> None:
+        lap = time.perf_counter() if self.prof_ctrl.enabled else 0.0
         if not self._resetting.is_set():
             com = self._update_com_guard()
+            lap = self._lap("com", lap)
             if any(self.active.values()):
                 self._streaming = True
             if self._streaming and com != "STOP" and self._servo_watchdog():
                 self.chassis.publish()
                 return
+            lap = self._lap("wd", lap)
             if self._streaming and com == "WARN":
                 self._warn_step(self._placo_to_deg14())
+                lap = self._lap("warn", lap)
             elif self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
                 arm_deg = self._placo_to_deg14()
+                lap = self._lap("placo", lap)
                 if self.safety:
                     arm_deg = self.safety.filter(arm_deg)
                 if self.arm.planner is None:
                     arm_deg = self._limit_step(arm_deg)
+                lap = self._lap("safety", lap)
                 self.arm.publish_planned_cmd(arm_deg, self.dt)
+                lap = self._lap("planpub", lap)
                 self._publish_ik_target(arm_deg)
                 self.prof_ctrl.note("pub", 1)
                 if self.arm.planner is not None and self.prof_ctrl.enabled:
                     self.prof_ctrl.note("planner_limited", self.arm.planner.limited_frames)
                     self.prof_ctrl.note("limit_clip_L", self.arm.planner.limit_clip_frames[:7].tolist())
                     self.prof_ctrl.note("limit_clip_R", self.arm.planner.limit_clip_frames[7:].tolist())
+                lap = self._lap("ikpub", lap)
             if self._gripper_limiter.ready():
                 self.arm.publish_gripper_cmd(
                     self.gripper_pos_target["left_arm"], self.gripper_pos_target["right_arm"]
                 )
+            lap = self._lap("grip", lap)
         self.chassis.publish()
+        self._lap("chassis", lap)
 
     def _servo_watchdog(self) -> bool:
         """ServoJ 流是否真的在被执行。返回 True 表示本拍已做恢复、调用方应跳过下发。
@@ -778,22 +797,14 @@ class F1RokaeTeleopController(HardwareTeleopController):
         2026-11-19 实测：外部客户端（Web UI/桥接）发 halt(255)+stop_motion 后，驱动结束 plan 的 SERVO_J 会话但阻抗会话仍在
         （state=RUNNING, activity=3），servo_cmd 被静默丢弃：指令走了 100°+，反馈纹丝不动，操作者只看到“双臂不动”。
         判据：最近 1 s 内指令某关节变化 ≥5° 而所有关节反馈变化 <0.3°。恢复：Placo/规划器重新锚定到反馈（臂没动，无跳变）
-        → 重新 set_motion_servo_mode(ServoJ) → 等下次握把激活继续。"""
-        cmd = self.arm.last_cmd_deg
-        if cmd is None or not self.arm.has_state:
+        → 重新 set_motion_servo_mode(ServoJ) → 等下次握把激活继续。
+        采样与判定在辅助线程（_servo_watchdog_sample）：在下发线程里每拍读反馈要和 1 kHz 状态回调抢锁，实测偶发卡 20~30 ms。"""
+        trip = self._sw_trip
+        if trip is None:
             return False
-        now = time.monotonic()
+        self._sw_trip = None
+        cmd_move, fb_move = trip
         fb = self.arm.get_arm_state_deg()
-        self._sw_hist.append((now, cmd.copy(), fb.copy()))
-        while self._sw_hist and now - self._sw_hist[0][0] > 1.0:
-            self._sw_hist.pop(0)
-        if now - self._sw_last_check < 0.2 or now - self._sw_hist[0][0] < 0.9:
-            return False
-        self._sw_last_check = now
-        cmds = np.array([h[1] for h in self._sw_hist]); fbs = np.array([h[2] for h in self._sw_hist])
-        cmd_move = float(np.max(np.ptp(cmds, axis=0))); fb_move = float(np.max(np.ptp(fbs, axis=0)))
-        if cmd_move < 5.0 or fb_move > 0.3:
-            return False
         print(f"[iNex] ❌ ServoJ 指令未被执行（1 s 内指令变化 {cmd_move:.1f}°，反馈 {fb_move:.2f}°）：驱动在静默丢弃我们的 ServoJ 流。"
               "现重新锚定到反馈并重新进入 ServoJ。")
         self._streaming = False
@@ -801,8 +812,28 @@ class F1RokaeTeleopController(HardwareTeleopController):
         self._sync_to_robot_pose(fb.copy())
         for part in (PART_LEFT_ARM, PART_RIGHT_ARM):
             self.inex.set_servo_mode(part)
-        self._sw_hist.clear()
         return True
+
+    def _servo_watchdog_sample(self) -> None:
+        """辅助线程每拍：记录 (指令, 反馈)，每 0.2 s 判定一次，触发时置 _sw_trip。"""
+        cmd = self.arm.last_cmd_deg
+        if (not self._streaming or self._resetting.is_set() or self._com_state == "STOP"
+                or cmd is None or not self.arm.has_state):
+            self._sw_trip = None           # 未在下发时不留待处理的触发，避免恢复后被误执行
+            return
+        now = time.monotonic()
+        fb = self.arm.get_arm_state_deg()
+        self._sw_hist.append((now, cmd.copy(), fb.copy()))
+        while self._sw_hist and now - self._sw_hist[0][0] > 1.0:
+            self._sw_hist.pop(0)
+        if now - self._sw_last_check < 0.2 or now - self._sw_hist[0][0] < 0.9:
+            return
+        self._sw_last_check = now
+        cmds = np.array([h[1] for h in self._sw_hist]); fbs = np.array([h[2] for h in self._sw_hist])
+        cmd_move = float(np.max(np.ptp(cmds, axis=0))); fb_move = float(np.max(np.ptp(fbs, axis=0)))
+        if cmd_move >= 5.0 and fb_move <= 0.3:
+            self._sw_hist.clear()
+            self._sw_trip = (cmd_move, fb_move)
 
     # ------------------------------------------------------------------ #
     # 辅助线程（30Hz）：数采按键 + 主端数据镜像
@@ -813,3 +844,4 @@ class F1RokaeTeleopController(HardwareTeleopController):
         if self._b_edge(bool(self.xr_client.get_button_state_by_name("B"))):
             self.recorder.stop()
         self.lead_pub.publish(self.arm.last_cmd_deg, self.head.get_target())
+        self._servo_watchdog_sample()
