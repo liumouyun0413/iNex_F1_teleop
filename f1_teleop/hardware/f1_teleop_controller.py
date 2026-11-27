@@ -118,6 +118,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
         )
         # 先用配置表收紧限位；连上驱动后再用 /inex/get_soft_limits 的实测值覆盖
         self._apply_driver_joint_limits(self._limits_cfg_to_dict(getattr(r, "arm_joint_limits_deg", None)))
+        self._q_snap: Optional[Dict[str, np.ndarray]] = None   # 下发线程读的 IK 结果快照（见 _placo_to_deg14）
         self.sync_arm_joints(self._deg14_to_placo(self.home_pose_deg))
 
         # 运行时状态
@@ -263,7 +264,26 @@ class F1RokaeTeleopController(HardwareTeleopController):
         }
 
     def _placo_to_deg14(self) -> np.ndarray:
+        """IK 结果快照（度）。不取 _placo_lock：IK 线程整圈持锁，下发线程等锁实测偶发 10~20 ms。"""
+        snap = self._q_snap
+        if snap is None:
+            return self._placo_live_deg14()
+        return np.concatenate([self.joint_map[n].rad_to_deg(snap[n]) for n in ARM_ORDER])
+
+    def _placo_live_deg14(self) -> np.ndarray:
         return np.concatenate([self.joint_map[n].rad_to_deg(self.get_arm_q(n)) for n in ARM_ORDER])
+
+    def _refresh_q_snapshot(self) -> None:
+        with self._placo_lock:
+            self._q_snap = {n: self.placo_robot.state.q[self.arm_q_slice[n]].copy() for n in ARM_ORDER}
+
+    def _update_ik(self) -> None:
+        super()._update_ik()
+        self._refresh_q_snapshot()
+
+    def sync_arm_joints(self, q_rad_by_arm: Dict[str, np.ndarray]) -> None:
+        super().sync_arm_joints(q_rad_by_arm)
+        self._refresh_q_snapshot()
 
     def _sync_to_robot_pose(self, arm_deg: np.ndarray) -> None:
         """Placo、安全门、ServoJ 规划器同时对齐到给定真机位姿（度）。"""
@@ -742,6 +762,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
             for name, qi in q.items():
                 self.placo_robot.state.q[self.arm_q_slice[name]] = qi
             self.placo_robot.update_kinematics()
+        self._refresh_q_snapshot()
 
     def _lap(self, name: str, t0: float) -> float:
         """F1_PROFILE=1 时把 _send_command 的分段耗时（ms）记入 control_thread.csv 的 extra 列。"""
@@ -763,7 +784,7 @@ class F1RokaeTeleopController(HardwareTeleopController):
                 return
             lap = self._lap("wd", lap)
             if self._streaming and com == "WARN":
-                self._warn_step(self._placo_to_deg14())
+                self._warn_step(self._placo_live_deg14())
                 lap = self._lap("warn", lap)
             elif self._streaming and com != "STOP":
                 # 有臂激活：目标 = IK 解；全部松开：目标保持上次 IK 解（规划器刹停保持）
